@@ -15,7 +15,6 @@ from .schemas import ContextPacket
 from .service import (
     AGENT_COMPOSE_STREAM,
     PLAN_STREAM,
-    TRAVEL_TASK_STREAM,
     compose_reply,
     create_tasks_for_decision,
     decide,
@@ -45,21 +44,7 @@ async def process_plan_message(fields: dict[str, str], redis: Redis | None = Non
             decision=decision,
         )
 
-    if redis is not None:
-        for task in tasks:
-            await redis.xadd(
-                TRAVEL_TASK_STREAM,
-                {
-                    "task_id": str(task.id),
-                    "task_type": task.task_type,
-                    "session_id": str(task.session_id),
-                    "turn_id": str(task.turn_id or ""),
-                    "context_version": str(task.context_version or ""),
-                    "deadline_at": task.deadline_at.isoformat()
-                    if task.deadline_at
-                    else "",
-                },
-            )
+    # task.queued outbox events are delivered to travel.tasks by app.outbox.
     return [task.id for task in tasks]
 
 
@@ -75,7 +60,12 @@ async def process_compose_message(fields: dict[str, str]) -> bool:
 
 
 async def main() -> None:
-    redis = Redis.from_url(settings.redis_url, decode_responses=True)
+    redis = Redis.from_url(
+        settings.redis_url,
+        decode_responses=True,
+        socket_connect_timeout=5,
+        socket_timeout=None,
+    )
     try:
         await ensure_consumer_groups(redis)
         while True:

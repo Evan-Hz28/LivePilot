@@ -1,8 +1,12 @@
+import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from sqlalchemy import Select, select, update
@@ -11,14 +15,31 @@ from app.config import settings
 from app.db import async_session_factory
 from app.models import EventOutbox, Preference, Task, TravelSession, Turn
 from app.agent.service import (
-    PLAN_STREAM,
-    build_context_packet,
     finalize_text_turn,
 )
+from app.outbox import run_outbox_publisher
 
 TASK_STREAM = "travel.tasks"
 
-app = FastAPI(title="LivePilot API")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    publisher_task = asyncio.create_task(run_outbox_publisher())
+    try:
+        yield
+    finally:
+        publisher_task.cancel()
+        await asyncio.gather(publisher_task, return_exceptions=True)
+
+
+app = FastAPI(title="LivePilot API", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.allowed_cors_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+)
 
 
 class CreateSessionRequest(BaseModel):
@@ -106,9 +127,13 @@ def serialize_task(task: Task) -> dict[str, object]:
 
 def serialize_event(event: EventOutbox) -> dict[str, object]:
     return {
+        "event_id": str(event.id),
+        "session_id": str(event.session_id),
         "event_seq": event.event_seq,
         "event_type": event.event_type,
         "payload": event.payload,
+        "dedupe_key": event.dedupe_key,
+        "published_at": event.published_at,
         "created_at": event.created_at,
     }
 
@@ -165,13 +190,13 @@ async def create_session(request: CreateSessionRequest) -> dict[str, object]:
         "context_version": 0,
         "preference_version": 1,
         "event_seq": 1,
+        "event_ws_url": f"/v1/sessions/{session_id}/events",
     }
 
 
-@app.get("/v1/sessions/{session_id}/snapshot")
-async def get_session_snapshot(
+async def _load_session_snapshot(
     session_id: UUID,
-    after_event_seq: int = Query(default=0, ge=0),
+    after_event_seq: int = 0,
 ) -> dict[str, object]:
     async with async_session_factory() as database_session:
         travel_session = await database_session.get(TravelSession, session_id)
@@ -222,7 +247,16 @@ async def get_session_snapshot(
             "context_version": travel_session.context_version,
         },
         "missed_events": [serialize_event(event) for event in events],
+        "after_event_seq": after_event_seq,
     }
+
+
+@app.get("/v1/sessions/{session_id}/snapshot")
+async def get_session_snapshot(
+    session_id: UUID,
+    after_event_seq: int = Query(default=0, ge=0),
+) -> dict[str, object]:
+    return await _load_session_snapshot(session_id, after_event_seq)
 
 
 @app.patch("/v1/sessions/{session_id}/preferences")
@@ -380,41 +414,149 @@ async def finalize_turn(
         except LookupError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
 
-        packet = await build_context_packet(
-            database_session,
-            session_id=session_id,
-            turn_id=finalized.turn_id,
-            context_version=finalized.context_version,
-            preference_version=finalized.preference_version,
-        )
-
-    queue_status = "queued"
-    redis = Redis.from_url(settings.redis_url, decode_responses=True)
-    try:
-        await redis.xadd(
-            PLAN_STREAM,
-            {
-                "session_id": str(session_id),
-                "turn_id": str(finalized.turn_id),
-                "context_version": str(finalized.context_version),
-                "packet": packet.model_dump_json(),
-            },
-        )
-    except Exception:
-        # The event and turn remain durable; a later outbox publisher can retry.
-        queue_status = "pending"
-    finally:
-        await redis.aclose()
-
     return {
         "session_id": str(session_id),
         "turn_id": str(finalized.turn_id),
         "context_version": finalized.context_version,
         "preference_version": finalized.preference_version,
         "event_seq": finalized.event_seq,
-        "status": queue_status,
+        "status": "pending",
         "client_event_id": client_event_id,
     }
+
+
+def _snapshot_message(snapshot: dict[str, object]) -> dict[str, object]:
+    session = snapshot["session"]
+    assert isinstance(session, dict)
+    event_seq = int(session["last_event_seq"])
+    session_id = str(session["session_id"])
+    return {
+        "type": "session.snapshot",
+        "event_type": "session.snapshot",
+        "event_id": f"snapshot:{session_id}:{event_seq}",
+        "event_seq": event_seq,
+        "session_id": session_id,
+        "payload": jsonable_encoder(snapshot),
+        "snapshot": jsonable_encoder(snapshot),
+    }
+
+
+def _event_message(event: dict[str, object]) -> dict[str, object]:
+    return jsonable_encoder({
+        "type": event["event_type"],
+        "event_type": event["event_type"],
+        "event_id": event["event_id"],
+        "event_seq": event["event_seq"],
+        "session_id": event["session_id"],
+        "payload": event["payload"],
+        "created_at": event["created_at"],
+    })
+
+
+async def _send_snapshot_and_missed_events(
+    websocket: WebSocket,
+    snapshot: dict[str, object],
+) -> int:
+    await websocket.send_json(_snapshot_message(snapshot))
+    missed_events = snapshot["missed_events"]
+    assert isinstance(missed_events, list)
+    for event in missed_events:
+        await websocket.send_json(_event_message(event))
+    session = snapshot["session"]
+    assert isinstance(session, dict)
+    return int(session["last_event_seq"])
+
+
+@app.websocket("/v1/sessions/{session_id}/events")
+@app.websocket("/v1/sessions/{session_id}/ws")
+async def session_events(websocket: WebSocket, session_id: UUID) -> None:
+    try:
+        after_event_seq = int(websocket.query_params.get("after_event_seq", "0"))
+    except ValueError:
+        await websocket.close(code=1008, reason="Invalid event cursor")
+        return
+    if after_event_seq < 0:
+        await websocket.close(code=1008, reason="after_event_seq must be non-negative")
+        return
+
+    try:
+        snapshot = await _load_session_snapshot(session_id, after_event_seq)
+    except HTTPException:
+        await websocket.close(code=1008, reason="Session not found")
+        return
+
+    await websocket.accept()
+    after_event_seq = await _send_snapshot_and_missed_events(websocket, snapshot)
+
+    try:
+        while True:
+            try:
+                message = await asyncio.wait_for(websocket.receive_json(), timeout=0.5)
+            except asyncio.TimeoutError:
+                message = None
+            except WebSocketDisconnect:
+                return
+
+            if message is not None:
+                message_type = message.get("type")
+                if message_type == "session.resume":
+                    requested_seq = message.get("after_event_seq", after_event_seq)
+                    try:
+                        requested_seq = max(0, int(requested_seq))
+                        snapshot = await _load_session_snapshot(session_id, requested_seq)
+                    except (TypeError, ValueError):
+                        await websocket.send_json(
+                            {"type": "error", "detail": "Invalid event cursor"}
+                        )
+                        continue
+                    after_event_seq = await _send_snapshot_and_missed_events(
+                        websocket, snapshot
+                    )
+                elif message_type == "turn.finalized":
+                    payload = message.get("payload") or message
+                    text = payload.get("text")
+                    if not isinstance(text, str) or not text.strip():
+                        await websocket.send_json(
+                            {"type": "error", "detail": "text is required"}
+                        )
+                        continue
+                    client_event_id = payload.get("client_event_id") or str(uuid4())
+                    async with async_session_factory() as database_session:
+                        try:
+                            finalized = await finalize_text_turn(
+                                database_session,
+                                session_id=session_id,
+                                text=text,
+                                client_event_id=client_event_id,
+                            )
+                        except LookupError:
+                            await websocket.send_json(
+                                {"type": "error", "detail": "Session not found"}
+                            )
+                            continue
+                    await websocket.send_json(
+                        {
+                            "type": "turn.accepted",
+                            "event_seq": finalized.event_seq,
+                            "session_id": str(session_id),
+                            "payload": {
+                                "turn_id": str(finalized.turn_id),
+                                "context_version": finalized.context_version,
+                                "preference_version": finalized.preference_version,
+                                "client_event_id": client_event_id,
+                            },
+                        }
+                    )
+                continue
+
+            snapshot = await _load_session_snapshot(session_id, after_event_seq)
+            missed_events = snapshot["missed_events"]
+            assert isinstance(missed_events, list)
+            for event in missed_events:
+                await websocket.send_json(_event_message(event))
+                after_event_seq = int(event["event_seq"])
+    except WebSocketDisconnect:
+        return
 
 
 @app.post(

@@ -11,8 +11,6 @@ from sqlalchemy import select
 from app.config import settings
 from app.db import async_session_factory
 from app.models import EventOutbox, Preference, Task, TravelSession
-from app.agent.service import COMPOSE_STREAM
-
 TASK_STREAM = "travel.tasks"
 GROUP_NAME = "livepilot-workers"
 CONSUMER_NAME = f"{socket.gethostname()}-worker"
@@ -100,7 +98,6 @@ def _mock_result(task: Task) -> dict:
 
 async def process_task(task_id: UUID, redis: Redis | None = None) -> None:
     task_type: str | None = None
-    task_context: tuple[UUID, UUID | None, int | None] | None = None
     async with async_session_factory() as database_session:
         async with database_session.begin():
             task = await database_session.scalar(
@@ -111,8 +108,18 @@ async def process_task(task_id: UUID, redis: Redis | None = None) -> None:
             task.status = "running"
             task.attempt += 1
             task.started_at = datetime.now(timezone.utc)
+            await _append_task_event(
+                database_session,
+                session_id=task.session_id,
+                event_type="task.running",
+                payload={
+                    "task_id": str(task.id),
+                    "turn_id": str(task.turn_id) if task.turn_id else None,
+                    "context_version": task.context_version,
+                },
+                dedupe_key=f"task.running:{task.id}",
+            )
             task_type = task.task_type
-            task_context = (task.session_id, task.turn_id, task.context_version)
 
     try:
         if task_type == "smoke_test":
@@ -165,20 +172,7 @@ async def process_task(task_id: UUID, redis: Redis | None = None) -> None:
                     dedupe_key=f"task.succeeded:{task.id}",
                 )
 
-                compose_fields = {
-                    "task_id": str(task.id),
-                    "session_id": str(task.session_id),
-                    "turn_id": str(task.turn_id),
-                    "context_version": str(task.context_version),
-                }
-
-        if redis is not None and task_context is not None and task_context[1] is not None:
-            try:
-                await redis.xadd(COMPOSE_STREAM, compose_fields)
-            except Exception:
-                # The committed task result remains authoritative; an outbox
-                # publisher can retry the compose notification independently.
-                logger.exception("compose enqueue failed: %s", task_id)
+        # task.succeeded outbox events are delivered to agent.compose by app.outbox.
         logger.info("task succeeded: %s", task_id)
     except Exception as error:
         async with async_session_factory() as database_session:
