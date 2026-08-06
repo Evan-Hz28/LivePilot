@@ -46,6 +46,11 @@ class TravelSession(Base):
         nullable=False,
         server_default="0",
     )
+    realtime_connection_epoch: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default="0",
+    )
     last_event_seq: Mapped[int] = mapped_column(
         BigInteger,
         nullable=False,

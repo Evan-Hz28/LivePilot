@@ -1,10 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
+import {
+  createMockRealtimeConnection,
+  type RealtimeConnectionState,
+  type RealtimeProviderConfig,
+} from './realtime/mockRealtime'
 
 type Session = {
   session_id: string
   status: string
   context_version: number
+  realtime_connection_epoch: number
   last_event_seq: number
   locale: string
   timezone: string
@@ -57,10 +63,21 @@ type WireMessage = {
   event_seq?: number
 }
 
+type RealtimeTokenResponse = {
+  token: string
+  device_id: string
+  connection_epoch: number
+  expires_at: string
+  provider_config: RealtimeProviderConfig
+}
+
+type VoiceState = 'idle' | 'requesting' | 'connecting' | 'live' | 'error'
+
 const API_BASE = (
   import.meta.env.VITE_API_BASE_URL || import.meta.env.VITE_API_URL || 'http://localhost:8000'
 ).replace(/\/$/, '')
 const SESSION_STORAGE_KEY = 'livepilot.session_id'
+const DEVICE_STORAGE_KEY = 'livepilot.device_id'
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
@@ -91,6 +108,16 @@ function taskLabel(status: string) {
   }[status] ?? status
 }
 
+function voiceLabel(state: VoiceState) {
+  return {
+    idle: '未连接',
+    requesting: '请求麦克风',
+    connecting: '建立音频链路',
+    live: '语音已连接',
+    error: '连接失败',
+  }[state]
+}
+
 function App() {
   const [sessionId, setSessionId] = useState(() => localStorage.getItem(SESSION_STORAGE_KEY))
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null)
@@ -100,8 +127,22 @@ function App() {
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [connection, setConnection] = useState<'offline' | 'connecting' | 'live'>('offline')
+  const [voiceState, setVoiceState] = useState<VoiceState>('idle')
+  const [partialTranscript, setPartialTranscript] = useState<string | null>(null)
+  const [voiceNotice, setVoiceNotice] = useState<string | null>(null)
+  const [deviceId] = useState(() => {
+    const saved = localStorage.getItem(DEVICE_STORAGE_KEY)
+    if (saved) return saved
+    const created = crypto.randomUUID()
+    localStorage.setItem(DEVICE_STORAGE_KEY, created)
+    return created
+  })
   const reconnectTimer = useRef<number | null>(null)
   const cursorRef = useRef(0)
+  const realtimeRef = useRef<ReturnType<typeof createMockRealtimeConnection> | null>(null)
+  const microphoneStreamRef = useRef<MediaStream | null>(null)
+  const remoteAudioRef = useRef<HTMLAudioElement>(null)
+  const voiceAttemptRef = useRef(0)
 
   const cursor = snapshot?.session.last_event_seq ?? 0
   useEffect(() => { cursorRef.current = cursor }, [cursor])
@@ -132,6 +173,13 @@ function App() {
     }, 0)
     return () => window.clearTimeout(loadTimer)
   }, [loadSnapshot, sessionId])
+
+  useEffect(() => () => {
+    realtimeRef.current?.close()
+    realtimeRef.current = null
+    microphoneStreamRef.current?.getTracks().forEach((track) => track.stop())
+    microphoneStreamRef.current = null
+  }, [])
 
   useEffect(() => {
     if (!sessionId) return
@@ -191,15 +239,14 @@ function App() {
     }
   }
 
-  async function submitTurn(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    if (!sessionId || !draft.trim()) return
+  const submitTurnText = useCallback(async (text: string) => {
+    if (!sessionId || !text.trim()) return
     setSubmitting(true)
     setError(null)
     try {
       const result = await api<{ event_seq: number }>(`/v1/sessions/${sessionId}/turns`, {
         method: 'POST',
-        body: JSON.stringify({ text: draft.trim(), client_event_id: crypto.randomUUID() }),
+        body: JSON.stringify({ text: text.trim(), client_event_id: crypto.randomUUID() }),
       })
       setDraft('')
       await loadSnapshot(sessionId, result.event_seq)
@@ -208,9 +255,112 @@ function App() {
     } finally {
       setSubmitting(false)
     }
+  }, [loadSnapshot, sessionId])
+
+  async function submitTurn(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    await submitTurnText(draft)
+  }
+
+  function stopVoice() {
+    voiceAttemptRef.current += 1
+    realtimeRef.current?.close()
+    realtimeRef.current = null
+    microphoneStreamRef.current?.getTracks().forEach((track) => track.stop())
+    microphoneStreamRef.current = null
+    const audio = remoteAudioRef.current
+    if (audio) {
+      audio.pause()
+      audio.srcObject = null
+    }
+    setPartialTranscript(null)
+    setVoiceNotice(null)
+    setVoiceState('idle')
+  }
+
+  async function startVoice() {
+    if (!sessionId || voiceState === 'live') return
+    const attempt = voiceAttemptRef.current + 1
+    voiceAttemptRef.current = attempt
+    setError(null)
+    setVoiceNotice(null)
+    setVoiceState('requesting')
+    let stream: MediaStream | null = null
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) throw new Error('当前浏览器不支持麦克风')
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+        },
+        video: false,
+      })
+      if (attempt !== voiceAttemptRef.current) {
+        stream.getTracks().forEach((track) => track.stop())
+        return
+      }
+      microphoneStreamRef.current = stream
+      const grant = await api<RealtimeTokenResponse>(`/v1/sessions/${sessionId}/realtime-token`, {
+        method: 'POST',
+        body: JSON.stringify({ device_id: deviceId }),
+      })
+      if (attempt !== voiceAttemptRef.current) return
+      setSnapshot((current) => current
+        ? { ...current, session: { ...current.session, realtime_connection_epoch: grant.connection_epoch } }
+        : current)
+      const redeemed = await api<Omit<RealtimeTokenResponse, 'token' | 'device_id'>>(
+        grant.provider_config.token_redeem_path,
+        {
+          method: 'POST',
+          body: JSON.stringify({ device_id: deviceId, token: grant.token }),
+        },
+      )
+      if (attempt !== voiceAttemptRef.current) return
+      setVoiceState('connecting')
+      const realtime = createMockRealtimeConnection(redeemed.provider_config, {
+        onConnectionState: (state: RealtimeConnectionState) => {
+          if (state === 'connected') setVoiceState('live')
+          else if (state === 'failed' || state === 'disconnected') setVoiceState('error')
+          else if (state !== 'closed') setVoiceState('connecting')
+        },
+        onProviderEvent: (event) => {
+          if (event.type === 'realtime.transcript.partial') setPartialTranscript(event.text ?? null)
+          if (event.type === 'realtime.transcript.final' && event.text) {
+            setPartialTranscript(null)
+            void submitTurnText(event.text)
+          }
+        },
+        onRemoteStream: (remoteStream) => {
+          const audio = remoteAudioRef.current
+          if (!audio) return
+          if (!remoteStream) {
+            audio.pause()
+            audio.srcObject = null
+            return
+          }
+          audio.srcObject = remoteStream
+          void audio.play().catch(() => setVoiceNotice('浏览器阻止了自动播放'))
+        },
+        onFirstAudioPacket: () => performance.mark('livepilot.realtime_audio_first_packet'),
+      })
+      realtimeRef.current = realtime
+      microphoneStreamRef.current = null
+      await realtime.connect(stream)
+    } catch (reason: unknown) {
+      if (attempt !== voiceAttemptRef.current) return
+      realtimeRef.current?.close()
+      realtimeRef.current = null
+      stream?.getTracks().forEach((track) => track.stop())
+      microphoneStreamRef.current = null
+      setVoiceState('error')
+      setError(reason instanceof Error ? reason.message : '语音连接失败')
+    }
   }
 
   function startNewSession() {
+    stopVoice()
     localStorage.removeItem(SESSION_STORAGE_KEY)
     setSessionId(null)
     setSnapshot(null)
@@ -227,7 +377,7 @@ function App() {
             <p className="eyebrow">LIVEPILOT / SESSION CONTROL</p>
             <h1>你的下一段旅程，从这里开始。</h1>
           </div>
-          <span className="build-tag">STAGE 05</span>
+          <span className="build-tag">STAGE 06</span>
         </header>
         <section className="create-band">
           <div className="create-copy">
@@ -272,7 +422,7 @@ function App() {
           <p className="eyebrow">LIVEPILOT / SESSION CONTROL</p>
           <h1>{typeof preference.destination === 'string' ? preference.destination : '未命名旅程'}</h1>
         </div>
-        <div className={`connection-state ${connection}`}><i />{connection === 'live' ? '实时连接' : connection === 'connecting' ? '正在连接' : '已离线'}</div>
+        <div className={`connection-state ${connection}`}><i />{connection === 'live' ? '会话在线' : connection === 'connecting' ? '正在连接' : '已离线'}</div>
         <button type="button" className="quiet-button" onClick={startNewSession} title="开始一个新的会话">新会话</button>
       </header>
 
@@ -304,6 +454,22 @@ function App() {
         </div>
 
         <aside className="insight-column">
+          <section className="panel voice-panel">
+            <div className="panel-heading"><div><span className="section-kicker">VOICE LINK</span><h2>语音链路</h2></div><span className={`voice-state ${voiceState}`}>{voiceLabel(voiceState)}</span></div>
+            <div className="voice-controls">
+              <button
+                type="button"
+                className={voiceState === 'live' || voiceState === 'connecting' || voiceState === 'requesting' ? 'quiet-button' : 'primary-button'}
+                onClick={() => (voiceState === 'live' || voiceState === 'connecting' || voiceState === 'requesting' ? stopVoice() : void startVoice())}
+              >
+                {voiceState === 'live' ? '关闭语音' : voiceState === 'connecting' || voiceState === 'requesting' ? '取消连接' : '开始语音'}
+              </button>
+              <span className="voice-epoch">epoch {snapshot.session.realtime_connection_epoch}</span>
+            </div>
+            {partialTranscript && <p className="partial-transcript">{partialTranscript}</p>}
+            {voiceNotice && <p className="voice-notice">{voiceNotice}</p>}
+            <audio ref={remoteAudioRef} autoPlay playsInline aria-label="远端语音" onPlaying={() => performance.mark('livepilot.speech_first_playout')} />
+          </section>
           <section className="panel preference-panel">
             <div className="panel-heading"><div><span className="section-kicker">ACTIVE CONTEXT</span><h2>当前偏好</h2></div><span className="version-badge">v{snapshot.active_preference?.version ?? '—'}</span></div>
             {preferenceEntries.length === 0 ? <p className="muted">还没有额外偏好。</p> : <dl className="preference-list">{preferenceEntries.map(([key, value]) => <div key={key}><dt>{key.replaceAll('_', ' ')}</dt><dd>{typeof value === 'object' ? JSON.stringify(value) : String(value)}</dd></div>)}</dl>}

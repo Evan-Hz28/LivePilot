@@ -1,14 +1,24 @@
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any
+from collections.abc import AsyncIterator
+from typing import Annotated, Any
 from uuid import UUID, uuid4
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
 from sqlalchemy import Select, select, update
 
 from app.config import settings
@@ -18,6 +28,11 @@ from app.agent.service import (
     finalize_text_turn,
 )
 from app.outbox import run_outbox_publisher
+from app.realtime import (
+    RealtimeTokenError,
+    issue_realtime_token,
+    redeem_realtime_token,
+)
 
 TASK_STREAM = "travel.tasks"
 
@@ -60,11 +75,32 @@ class FinalizeTurnRequest(BaseModel):
     client_event_id: str | None = Field(default=None, min_length=1, max_length=100)
 
 
+class RealtimeTokenRequest(BaseModel):
+    device_id: str = Field(min_length=1, max_length=128)
+
+
+class RealtimeTokenRedeemRequest(BaseModel):
+    device_id: str = Field(min_length=1, max_length=128)
+    token: str = Field(min_length=1, max_length=512)
+
+
+async def get_realtime_redis() -> AsyncIterator[Redis]:
+    redis = Redis.from_url(settings.redis_url, decode_responses=True)
+    try:
+        yield redis
+    finally:
+        await redis.aclose()
+
+
+RealtimeRedis = Annotated[Redis, Depends(get_realtime_redis)]
+
+
 def serialize_session(session: TravelSession) -> dict[str, object]:
     return {
         "session_id": str(session.id),
         "status": session.status,
         "context_version": session.context_version,
+        "realtime_connection_epoch": session.realtime_connection_epoch,
         "last_event_seq": session.last_event_seq,
         "locale": session.locale,
         "timezone": session.timezone,
@@ -257,6 +293,71 @@ async def get_session_snapshot(
     after_event_seq: int = Query(default=0, ge=0),
 ) -> dict[str, object]:
     return await _load_session_snapshot(session_id, after_event_seq)
+
+
+@app.post("/v1/sessions/{session_id}/realtime-token")
+async def create_realtime_token(
+    session_id: UUID,
+    request: RealtimeTokenRequest,
+    redis: RealtimeRedis,
+) -> dict[str, object]:
+    async with async_session_factory() as database_session:
+        try:
+            grant = await issue_realtime_token(
+                database_session,
+                redis,
+                session_id=session_id,
+                device_id=request.device_id,
+            )
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except RedisError as error:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Realtime token service unavailable",
+            ) from error
+
+    return {
+        "token": grant.token,
+        "device_id": grant.device_id,
+        "connection_epoch": grant.connection_epoch,
+        "expires_at": grant.expires_at,
+        "provider_config": grant.provider_config,
+    }
+
+
+@app.post("/v1/sessions/{session_id}/realtime-token/redeem")
+async def redeem_session_realtime_token(
+    session_id: UUID,
+    request: RealtimeTokenRedeemRequest,
+    redis: RealtimeRedis,
+) -> dict[str, object]:
+    async with async_session_factory() as database_session:
+        try:
+            grant = await redeem_realtime_token(
+                database_session,
+                redis,
+                session_id=session_id,
+                device_id=request.device_id,
+                token=request.token,
+            )
+        except RealtimeTokenError as error:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Realtime token is invalid or expired",
+            ) from error
+        except RedisError as error:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Realtime token service unavailable",
+            ) from error
+
+    return {
+        "device_id": grant.device_id,
+        "connection_epoch": grant.connection_epoch,
+        "expires_at": grant.expires_at,
+        "provider_config": grant.provider_config,
+    }
 
 
 @app.patch("/v1/sessions/{session_id}/preferences")
