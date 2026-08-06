@@ -70,6 +70,15 @@ class TravelSession(Base):
 
 class Task(Base):
     __tablename__ = "tasks"
+    __table_args__ = (
+        UniqueConstraint("session_id", "idempotency_key"),
+        Index(
+            "idx_tasks_session_context_status",
+            "session_id",
+            "context_version",
+            "status",
+        ),
+    )
 
     id: Mapped[UUID] = mapped_column(
         PostgresUUID(as_uuid=True),
@@ -82,9 +91,26 @@ class Task(Base):
         nullable=False,
         index=True,
     )
+    turn_id: Mapped[UUID | None] = mapped_column(
+        PostgresUUID(as_uuid=True),
+        ForeignKey("turns.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    context_version: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+    target_preference_version: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
     task_type: Mapped[str] = mapped_column(
         String(48),
         nullable=False,
+    )
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(160),
+        nullable=True,
     )
     status: Mapped[str] = mapped_column(
         String(24),
@@ -109,6 +135,10 @@ class Task(Base):
         Integer,
         nullable=False,
         server_default="0",
+    )
+    deadline_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -162,6 +192,10 @@ class Turn(Base):
     parent_turn_id: Mapped[UUID | None] = mapped_column(
         PostgresUUID(as_uuid=True),
         ForeignKey("turns.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    content: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB,
         nullable=True,
     )
     interrupt_reason: Mapped[str | None] = mapped_column(

@@ -10,6 +10,11 @@ from sqlalchemy import Select, select, update
 from app.config import settings
 from app.db import async_session_factory
 from app.models import EventOutbox, Preference, Task, TravelSession, Turn
+from app.agent.service import (
+    PLAN_STREAM,
+    build_context_packet,
+    finalize_text_turn,
+)
 
 TASK_STREAM = "travel.tasks"
 
@@ -27,6 +32,11 @@ class PreferenceUpdateRequest(BaseModel):
     patch: dict[str, Any] = Field(min_length=1)
     client_event_id: str | None = Field(default=None, min_length=1, max_length=100)
     source_turn_id: UUID | None = None
+
+
+class FinalizeTurnRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=20_000)
+    client_event_id: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 def serialize_session(session: TravelSession) -> dict[str, object]:
@@ -55,6 +65,7 @@ def serialize_preference(preference: Preference) -> dict[str, object]:
 
 
 def serialize_turn(turn: Turn) -> dict[str, object]:
+    content = turn.content or {}
     return {
         "turn_id": str(turn.id),
         "sequence_no": turn.sequence_no,
@@ -63,6 +74,9 @@ def serialize_turn(turn: Turn) -> dict[str, object]:
         "context_version": turn.context_version,
         "parent_turn_id": str(turn.parent_turn_id) if turn.parent_turn_id else None,
         "interrupt_reason": turn.interrupt_reason,
+        "content": turn.content,
+        "text": content.get("text"),
+        "reply_context": content.get("reply_context"),
         "started_at": turn.started_at,
         "finalized_at": turn.finalized_at,
         "completed_at": turn.completed_at,
@@ -72,12 +86,18 @@ def serialize_turn(turn: Turn) -> dict[str, object]:
 def serialize_task(task: Task) -> dict[str, object]:
     return {
         "task_id": str(task.id),
+        "session_id": str(task.session_id),
+        "turn_id": str(task.turn_id) if task.turn_id else None,
         "task_type": task.task_type,
         "status": task.status,
+        "context_version": task.context_version,
+        "target_preference_version": task.target_preference_version,
+        "idempotency_key": task.idempotency_key,
         "payload": task.payload,
         "result": task.result,
         "error_message": task.error_message,
         "attempt": task.attempt,
+        "deadline_at": task.deadline_at,
         "created_at": task.created_at,
         "started_at": task.started_at,
         "finished_at": task.finished_at,
@@ -337,6 +357,63 @@ async def update_preferences(
         "preference_version": preference.version,
         "cancelled_task_ids": [],
         "event_seq": updated_state[1],
+    }
+
+
+@app.post(
+    "/v1/sessions/{session_id}/turns",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def finalize_turn(
+    session_id: UUID,
+    request: FinalizeTurnRequest,
+) -> dict[str, object]:
+    client_event_id = request.client_event_id or str(uuid4())
+    async with async_session_factory() as database_session:
+        try:
+            finalized = await finalize_text_turn(
+                database_session,
+                session_id=session_id,
+                text=request.text,
+                client_event_id=client_event_id,
+            )
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+        packet = await build_context_packet(
+            database_session,
+            session_id=session_id,
+            turn_id=finalized.turn_id,
+            context_version=finalized.context_version,
+            preference_version=finalized.preference_version,
+        )
+
+    queue_status = "queued"
+    redis = Redis.from_url(settings.redis_url, decode_responses=True)
+    try:
+        await redis.xadd(
+            PLAN_STREAM,
+            {
+                "session_id": str(session_id),
+                "turn_id": str(finalized.turn_id),
+                "context_version": str(finalized.context_version),
+                "packet": packet.model_dump_json(),
+            },
+        )
+    except Exception:
+        # The event and turn remain durable; a later outbox publisher can retry.
+        queue_status = "pending"
+    finally:
+        await redis.aclose()
+
+    return {
+        "session_id": str(session_id),
+        "turn_id": str(finalized.turn_id),
+        "context_version": finalized.context_version,
+        "preference_version": finalized.preference_version,
+        "event_seq": finalized.event_seq,
+        "status": queue_status,
+        "client_event_id": client_event_id,
     }
 
 
