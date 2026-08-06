@@ -24,6 +24,7 @@ type RealtimeHandlers = {
 
 export type MockRealtimeConnection = {
   connect: (microphoneStream: MediaStream) => Promise<void>
+  cancel: (playbackId?: string) => boolean
   close: () => void
 }
 
@@ -52,6 +53,7 @@ export function createMockRealtimeConnection(
   let microphoneStream: MediaStream | null = null
   let audioContext: AudioContext | null = null
   let oscillator: OscillatorNode | null = null
+  let browserChannel: RTCDataChannel | null = null
   let closed = false
 
   function dispose(state: RealtimeConnectionState) {
@@ -65,6 +67,7 @@ export function createMockRealtimeConnection(
     providerPeer?.close()
     browserPeer = null
     providerPeer = null
+    browserChannel = null
     microphoneStream?.getTracks().forEach((track) => track.stop())
     microphoneStream = null
     handlers.onRemoteStream(null)
@@ -112,7 +115,7 @@ export function createMockRealtimeConnection(
         handlers.onRemoteStream(remoteStream)
       }
 
-      const browserChannel = browserPeer.createDataChannel(config.data_channel_label)
+      browserChannel = browserPeer.createDataChannel(config.data_channel_label)
       browserChannel.onmessage = (event) => {
         try {
           const parsed = providerEvent(JSON.parse(String(event.data)))
@@ -126,6 +129,18 @@ export function createMockRealtimeConnection(
           sendMockEvent(event.channel, {
             type: 'realtime.connection.changed',
           })
+        }
+        event.channel.onmessage = (message) => {
+          try {
+            const payload = JSON.parse(String(message.data)) as Record<string, unknown>
+            if (payload.type !== 'response.cancel') return
+            sendMockEvent(event.channel, {
+              type: 'realtime.response.cancelled',
+              playback_id: typeof payload.playback_id === 'string' ? payload.playback_id : undefined,
+            })
+          } catch {
+            // Provider control messages are best effort and do not affect transport state.
+          }
         }
       }
 
@@ -167,6 +182,11 @@ export function createMockRealtimeConnection(
       browserHasRemoteDescription = true
       pendingForBrowser.forEach((candidate) => addCandidate(browserPeer!, candidate))
       pendingForBrowser.length = 0
+    },
+    cancel(playbackId) {
+      if (closed || browserChannel?.readyState !== 'open') return false
+      browserChannel.send(JSON.stringify({ type: 'response.cancel', playback_id: playbackId }))
+      return true
     },
     close() {
       dispose('closed')

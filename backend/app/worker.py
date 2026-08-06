@@ -8,6 +8,7 @@ from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 from sqlalchemy import select
 
+from app.cancellation import has_task_cancel_key
 from app.config import settings
 from app.db import async_session_factory
 from app.models import EventOutbox, Preference, Task, TravelSession
@@ -64,6 +65,23 @@ async def _append_task_event(
     )
 
 
+async def _lock_task_and_session(database_session, task_id: UUID):
+    task_reference = await database_session.get(Task, task_id)
+    if task_reference is None:
+        return None, None
+    session = await database_session.scalar(
+        select(TravelSession)
+        .where(TravelSession.id == task_reference.session_id)
+        .with_for_update()
+    )
+    if session is None:
+        return None, None
+    task = await database_session.scalar(
+        select(Task).where(Task.id == task_id).with_for_update()
+    )
+    return session, task
+
+
 async def _task_context_is_current(database_session, task: Task) -> bool:
     if task.context_version is None:
         return True
@@ -80,6 +98,36 @@ async def _task_context_is_current(database_session, task: Task) -> bool:
         )
     )
     return preference is not None
+
+
+async def _task_cancellation_requested(task_id: UUID, redis: Redis | None) -> bool:
+    if await has_task_cancel_key(redis, task_id):
+        return True
+    async with async_session_factory() as database_session:
+        task = await database_session.get(Task, task_id)
+        return task is not None and task.status == "cancel_requested"
+
+
+async def _mark_task_cancelled(task_id: UUID) -> bool:
+    async with async_session_factory() as database_session:
+        async with database_session.begin():
+            _, task = await _lock_task_and_session(database_session, task_id)
+            if task is None or task.status != "cancel_requested":
+                return False
+            task.status = "cancelled"
+            task.finished_at = datetime.now(timezone.utc)
+            await _append_task_event(
+                database_session,
+                session_id=task.session_id,
+                event_type="task.cancelled",
+                payload={
+                    "task_id": str(task.id),
+                    "turn_id": str(task.turn_id) if task.turn_id else None,
+                    "context_version": task.context_version,
+                },
+                dedupe_key=f"task.cancelled:{task.id}",
+            )
+            return True
 
 
 def _mock_result(task: Task) -> dict:
@@ -100,10 +148,25 @@ async def process_task(task_id: UUID, redis: Redis | None = None) -> None:
     task_type: str | None = None
     async with async_session_factory() as database_session:
         async with database_session.begin():
-            task = await database_session.scalar(
-                select(Task).where(Task.id == task_id).with_for_update()
-            )
-            if task is None or task.status != "queued":
+            _, task = await _lock_task_and_session(database_session, task_id)
+            if task is None:
+                return
+            if task.status == "cancel_requested":
+                task.status = "cancelled"
+                task.finished_at = datetime.now(timezone.utc)
+                await _append_task_event(
+                    database_session,
+                    session_id=task.session_id,
+                    event_type="task.cancelled",
+                    payload={
+                        "task_id": str(task.id),
+                        "turn_id": str(task.turn_id) if task.turn_id else None,
+                        "context_version": task.context_version,
+                    },
+                    dedupe_key=f"task.cancelled:{task.id}",
+                )
+                return
+            if task.status != "queued":
                 return
             task.status = "running"
             task.attempt += 1
@@ -122,6 +185,10 @@ async def process_task(task_id: UUID, redis: Redis | None = None) -> None:
             task_type = task.task_type
 
     try:
+        if await _task_cancellation_requested(task_id, redis):
+            await _mark_task_cancelled(task_id)
+            return
+
         if task_type == "smoke_test":
             result = {"message": "worker ok"}
         elif task_type == "mock_travel":
@@ -133,18 +200,23 @@ async def process_task(task_id: UUID, redis: Redis | None = None) -> None:
         else:
             raise ValueError(f"Unsupported task type: {task_type}")
 
+        cancelled_after_execution = await _task_cancellation_requested(task_id, redis)
         async with async_session_factory() as database_session:
             async with database_session.begin():
-                task = await database_session.scalar(
-                    select(Task).where(Task.id == task_id).with_for_update()
-                )
+                _, task = await _lock_task_and_session(database_session, task_id)
                 if task is None:
                     return
 
+                cancelled_before_commit = await has_task_cancel_key(redis, task_id)
                 current = await _task_context_is_current(database_session, task)
                 task.result = result
                 task.finished_at = datetime.now(timezone.utc)
-                if not current or task.status in {"cancel_requested", "cancelled"}:
+                if (
+                    cancelled_after_execution
+                    or cancelled_before_commit
+                    or not current
+                    or task.status in {"cancel_requested", "cancelled"}
+                ):
                     task.status = "discarded"
                     await _append_task_event(
                         database_session,
@@ -177,10 +249,26 @@ async def process_task(task_id: UUID, redis: Redis | None = None) -> None:
     except Exception as error:
         async with async_session_factory() as database_session:
             async with database_session.begin():
-                task = await database_session.scalar(
-                    select(Task).where(Task.id == task_id).with_for_update()
-                )
-                if task is not None:
+                _, task = await _lock_task_and_session(database_session, task_id)
+                if task is not None and task.status == "cancel_requested":
+                    task.status = "cancelled"
+                    task.finished_at = datetime.now(timezone.utc)
+                    await _append_task_event(
+                        database_session,
+                        session_id=task.session_id,
+                        event_type="task.cancelled",
+                        payload={
+                            "task_id": str(task.id),
+                            "turn_id": str(task.turn_id) if task.turn_id else None,
+                            "context_version": task.context_version,
+                        },
+                        dedupe_key=f"task.cancelled:{task.id}",
+                    )
+                elif task is not None and task.status not in {
+                    "cancelled",
+                    "discarded",
+                    "succeeded",
+                }:
                     task.status = "failed"
                     task.error_message = str(error)
                     task.finished_at = datetime.now(timezone.utc)

@@ -39,6 +39,7 @@ type Turn = {
 
 type Task = {
   task_id: string
+  turn_id: string | null
   task_type: string
   status: string
   context_version: number | null
@@ -71,6 +72,8 @@ type RealtimeTokenResponse = {
   provider_config: RealtimeProviderConfig
 }
 
+type ResumeResponse = RealtimeTokenResponse & { snapshot: Snapshot }
+
 type VoiceState = 'idle' | 'requesting' | 'connecting' | 'live' | 'error'
 
 const API_BASE = (
@@ -102,6 +105,8 @@ function taskLabel(status: string) {
   return {
     queued: '排队中',
     running: '查询中',
+    cancel_requested: '正在取消',
+    cancelled: '已取消',
     succeeded: '已完成',
     failed: '失败',
     discarded: '已过期',
@@ -142,6 +147,7 @@ function App() {
   const realtimeRef = useRef<ReturnType<typeof createMockRealtimeConnection> | null>(null)
   const microphoneStreamRef = useRef<MediaStream | null>(null)
   const remoteAudioRef = useRef<HTMLAudioElement>(null)
+  const activePlaybackIdRef = useRef<string | null>(null)
   const voiceAttemptRef = useRef(0)
 
   const cursor = snapshot?.session.last_event_seq ?? 0
@@ -149,6 +155,12 @@ function App() {
   const latestReply = useMemo(
     () => [...(snapshot?.turns ?? [])].reverse().find((turn) => turn.kind === 'agent_reply'),
     [snapshot?.turns],
+  )
+  const activeTask = useMemo(
+    () => [...(snapshot?.tasks ?? [])].reverse().find(
+      (task) => task.turn_id && ['queued', 'running', 'cancel_requested'].includes(task.status),
+    ),
+    [snapshot?.tasks],
   )
 
   const loadSnapshot = useCallback(async (id: string, after = 0) => {
@@ -263,19 +275,42 @@ function App() {
   }
 
   function stopVoice() {
+    const playbackId = activePlaybackIdRef.current
+    const turnId = activeTask?.turn_id
+    const realtime = realtimeRef.current
     voiceAttemptRef.current += 1
-    realtimeRef.current?.close()
-    realtimeRef.current = null
-    microphoneStreamRef.current?.getTracks().forEach((track) => track.stop())
-    microphoneStreamRef.current = null
     const audio = remoteAudioRef.current
     if (audio) {
       audio.pause()
       audio.srcObject = null
     }
+    activePlaybackIdRef.current = null
     setPartialTranscript(null)
     setVoiceNotice(null)
     setVoiceState('idle')
+
+    realtime?.cancel(playbackId ?? undefined)
+    if (sessionId && turnId) {
+      void api<{ event_seq: number }>(`/v1/sessions/${sessionId}/interrupt`, {
+        method: 'POST',
+        body: JSON.stringify({
+          turn_id: turnId,
+          playback_id: playbackId,
+          reason: 'voice_stopped',
+          client_event_id: crypto.randomUUID(),
+          occurred_at: new Date().toISOString(),
+        }),
+      })
+        .then((result) => loadSnapshot(sessionId, result.event_seq))
+        .catch((reason: unknown) => {
+          setError(reason instanceof Error ? reason.message : '打断请求失败')
+        })
+    }
+
+    realtime?.close()
+    realtimeRef.current = null
+    microphoneStreamRef.current?.getTracks().forEach((track) => track.stop())
+    microphoneStreamRef.current = null
   }
 
   async function startVoice() {
@@ -302,14 +337,33 @@ function App() {
         return
       }
       microphoneStreamRef.current = stream
-      const grant = await api<RealtimeTokenResponse>(`/v1/sessions/${sessionId}/realtime-token`, {
-        method: 'POST',
-        body: JSON.stringify({ device_id: deviceId }),
-      })
+      const previousConnectionEpoch = snapshot?.session.realtime_connection_epoch ?? 0
+      let grant: RealtimeTokenResponse
+      let resumedSnapshot: Snapshot | null = null
+      if (previousConnectionEpoch > 0) {
+        const resumed = await api<ResumeResponse>(`/v1/sessions/${sessionId}/resume`, {
+          method: 'POST',
+          body: JSON.stringify({
+            after_event_seq: cursorRef.current,
+            previous_connection_epoch: previousConnectionEpoch,
+            device_id: deviceId,
+          }),
+        })
+        grant = resumed
+        resumedSnapshot = resumed.snapshot
+      } else {
+        grant = await api<RealtimeTokenResponse>(`/v1/sessions/${sessionId}/realtime-token`, {
+          method: 'POST',
+          body: JSON.stringify({ device_id: deviceId }),
+        })
+      }
       if (attempt !== voiceAttemptRef.current) return
-      setSnapshot((current) => current
-        ? { ...current, session: { ...current.session, realtime_connection_epoch: grant.connection_epoch } }
-        : current)
+      if (resumedSnapshot) setSnapshot(resumedSnapshot)
+      else {
+        setSnapshot((current) => current
+          ? { ...current, session: { ...current.session, realtime_connection_epoch: grant.connection_epoch } }
+          : current)
+      }
       const redeemed = await api<Omit<RealtimeTokenResponse, 'token' | 'device_id'>>(
         grant.provider_config.token_redeem_path,
         {
@@ -321,11 +375,19 @@ function App() {
       setVoiceState('connecting')
       const realtime = createMockRealtimeConnection(redeemed.provider_config, {
         onConnectionState: (state: RealtimeConnectionState) => {
+          if (attempt !== voiceAttemptRef.current) return
           if (state === 'connected') setVoiceState('live')
           else if (state === 'failed' || state === 'disconnected') setVoiceState('error')
           else if (state !== 'closed') setVoiceState('connecting')
         },
         onProviderEvent: (event) => {
+          if (attempt !== voiceAttemptRef.current) return
+          if (event.type === 'realtime.response.started') {
+            activePlaybackIdRef.current = event.playback_id ?? null
+          }
+          if (event.type === 'realtime.response.cancelled') {
+            activePlaybackIdRef.current = null
+          }
           if (event.type === 'realtime.transcript.partial') setPartialTranscript(event.text ?? null)
           if (event.type === 'realtime.transcript.final' && event.text) {
             setPartialTranscript(null)
@@ -333,6 +395,7 @@ function App() {
           }
         },
         onRemoteStream: (remoteStream) => {
+          if (attempt !== voiceAttemptRef.current) return
           const audio = remoteAudioRef.current
           if (!audio) return
           if (!remoteStream) {
@@ -343,7 +406,11 @@ function App() {
           audio.srcObject = remoteStream
           void audio.play().catch(() => setVoiceNotice('浏览器阻止了自动播放'))
         },
-        onFirstAudioPacket: () => performance.mark('livepilot.realtime_audio_first_packet'),
+        onFirstAudioPacket: () => {
+          if (attempt === voiceAttemptRef.current) {
+            performance.mark('livepilot.realtime_audio_first_packet')
+          }
+        },
       })
       realtimeRef.current = realtime
       microphoneStreamRef.current = null

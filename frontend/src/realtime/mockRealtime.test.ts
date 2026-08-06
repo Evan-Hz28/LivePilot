@@ -157,6 +157,12 @@ describe('mock realtime connection', () => {
     expect(remoteStreams).toEqual([remoteStream])
     expect(events).toContain('realtime.connection.changed')
 
+    expect(connection.cancel('playback-1')).toBe(true)
+    expect(FakePeerConnection.peers[0].outgoingChannel?.sent).toContain(
+      JSON.stringify({ type: 'response.cancel', playback_id: 'playback-1' }),
+    )
+    expect(events).toContain('realtime.response.cancelled')
+
     connection.close()
 
     expect(microphoneTrack.stop).toHaveBeenCalledOnce()

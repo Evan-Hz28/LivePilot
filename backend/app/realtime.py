@@ -22,6 +22,10 @@ class RealtimeTokenError(Exception):
     """The token is missing, expired, consumed, or no longer current."""
 
 
+class RealtimeTokenEpochError(RealtimeTokenError):
+    """The client is attempting to resume a connection that is no longer current."""
+
+
 @dataclass(frozen=True)
 class RealtimeTokenGrant:
     token: str
@@ -55,6 +59,7 @@ async def issue_realtime_token(
     *,
     session_id: UUID,
     device_id: str,
+    expected_connection_epoch: int | None = None,
 ) -> RealtimeTokenGrant:
     token = secrets.token_urlsafe(32)
     expires_at = datetime.now(timezone.utc) + timedelta(
@@ -69,6 +74,11 @@ async def issue_realtime_token(
         )
         if session is None:
             raise LookupError("Session not found")
+        if (
+            expected_connection_epoch is not None
+            and session.realtime_connection_epoch != expected_connection_epoch
+        ):
+            raise RealtimeTokenEpochError("Realtime connection epoch is stale")
         session.realtime_connection_epoch += 1
         connection_epoch = session.realtime_connection_epoch
 

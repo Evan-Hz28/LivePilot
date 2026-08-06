@@ -22,13 +22,16 @@ from redis.exceptions import RedisError
 from sqlalchemy import Select, select, update
 
 from app.config import settings
+from app.cancellation import write_task_cancel_keys
 from app.db import async_session_factory
+from app.interrupts import InterruptResult, register_interrupt
 from app.models import EventOutbox, Preference, Task, TravelSession, Turn
 from app.agent.service import (
     finalize_text_turn,
 )
 from app.outbox import run_outbox_publisher
 from app.realtime import (
+    RealtimeTokenEpochError,
     RealtimeTokenError,
     issue_realtime_token,
     redeem_realtime_token,
@@ -84,6 +87,20 @@ class RealtimeTokenRedeemRequest(BaseModel):
     token: str = Field(min_length=1, max_length=512)
 
 
+class InterruptRequest(BaseModel):
+    turn_id: UUID
+    playback_id: str | None = Field(default=None, max_length=128)
+    reason: str = Field(default="user_interrupt", min_length=1, max_length=64)
+    client_event_id: str | None = Field(default=None, min_length=1, max_length=100)
+    occurred_at: datetime | None = None
+
+
+class ResumeSessionRequest(BaseModel):
+    after_event_seq: int = Field(ge=0)
+    previous_connection_epoch: int = Field(ge=0)
+    device_id: str = Field(min_length=1, max_length=128)
+
+
 async def get_realtime_redis() -> AsyncIterator[Redis]:
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
     try:
@@ -93,6 +110,38 @@ async def get_realtime_redis() -> AsyncIterator[Redis]:
 
 
 RealtimeRedis = Annotated[Redis, Depends(get_realtime_redis)]
+
+
+def serialize_interrupt(result: InterruptResult) -> dict[str, object]:
+    return {
+        "accepted": True,
+        "turn_id": str(result.turn_id),
+        "turn_status": result.turn_status,
+        "context_version": result.context_version,
+        "cancelled_task_ids": [str(task_id) for task_id in result.cancelled_task_ids],
+        "event_seq": result.event_seq,
+    }
+
+
+async def handle_interrupt(
+    *,
+    session_id: UUID,
+    request: InterruptRequest,
+    redis: Redis,
+) -> dict[str, object]:
+    client_event_id = request.client_event_id or str(uuid4())
+    async with async_session_factory() as database_session:
+        result = await register_interrupt(
+            database_session,
+            session_id=session_id,
+            turn_id=request.turn_id,
+            playback_id=request.playback_id,
+            reason=request.reason,
+            occurred_at=request.occurred_at or datetime.now(timezone.utc),
+            client_event_id=client_event_id,
+        )
+    await write_task_cancel_keys(redis, result.cancelled_task_ids)
+    return serialize_interrupt(result)
 
 
 def serialize_session(session: TravelSession) -> dict[str, object]:
@@ -360,6 +409,42 @@ async def redeem_session_realtime_token(
     }
 
 
+@app.post("/v1/sessions/{session_id}/resume")
+async def resume_session(
+    session_id: UUID,
+    request: ResumeSessionRequest,
+    redis: RealtimeRedis,
+) -> dict[str, object]:
+    async with async_session_factory() as database_session:
+        try:
+            grant = await issue_realtime_token(
+                database_session,
+                redis,
+                session_id=session_id,
+                device_id=request.device_id,
+                expected_connection_epoch=request.previous_connection_epoch,
+            )
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except RealtimeTokenEpochError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except RedisError as error:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Realtime token service unavailable",
+            ) from error
+
+    snapshot = await _load_session_snapshot(session_id, request.after_event_seq)
+    return {
+        "snapshot": snapshot,
+        "token": grant.token,
+        "device_id": grant.device_id,
+        "connection_epoch": grant.connection_epoch,
+        "expires_at": grant.expires_at,
+        "provider_config": grant.provider_config,
+    }
+
+
 @app.patch("/v1/sessions/{session_id}/preferences")
 async def update_preferences(
     session_id: UUID,
@@ -493,6 +578,26 @@ async def update_preferences(
         "cancelled_task_ids": [],
         "event_seq": updated_state[1],
     }
+
+
+@app.post("/v1/sessions/{session_id}/interrupt")
+async def interrupt_session(
+    session_id: UUID,
+    request: InterruptRequest,
+    redis: RealtimeRedis,
+) -> dict[str, object]:
+    try:
+        return await handle_interrupt(
+            session_id=session_id,
+            request=request,
+            redis=redis,
+        )
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 @app.post(
@@ -648,6 +753,50 @@ async def session_events(websocket: WebSocket, session_id: UUID) -> None:
                             },
                         }
                     )
+                elif message_type == "agent.interrupt":
+                    nested_payload = message.get("payload")
+                    payload = {
+                        **message,
+                        **(nested_payload if isinstance(nested_payload, dict) else {}),
+                    }
+                    try:
+                        request = InterruptRequest.model_validate(payload)
+                    except ValueError as error:
+                        await websocket.send_json(
+                            {"type": "error", "detail": str(error)}
+                        )
+                        continue
+
+                    redis = Redis.from_url(settings.redis_url, decode_responses=True)
+                    try:
+                        accepted = await handle_interrupt(
+                            session_id=session_id,
+                            request=request,
+                            redis=redis,
+                        )
+                    except LookupError:
+                        await websocket.send_json(
+                            {"type": "error", "detail": "Session not found"}
+                        )
+                    except ValueError as error:
+                        await websocket.send_json(
+                            {"type": "error", "detail": str(error)}
+                        )
+                    except RuntimeError as error:
+                        await websocket.send_json(
+                            {"type": "error", "detail": str(error)}
+                        )
+                    else:
+                        await websocket.send_json(
+                            {
+                                "type": "agent.interrupt.accepted",
+                                "session_id": str(session_id),
+                                "event_seq": accepted["event_seq"],
+                                "payload": accepted,
+                            }
+                        )
+                    finally:
+                        await redis.aclose()
                 continue
 
             snapshot = await _load_session_snapshot(session_id, after_event_seq)
