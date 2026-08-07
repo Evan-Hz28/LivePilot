@@ -10,6 +10,7 @@ from redis.exceptions import ResponseError
 
 from app.config import settings
 from app.db import async_session_factory
+from app.observability import extract_trace_context, trace_scope
 
 from .schemas import ContextPacket
 from .service import (
@@ -36,49 +37,69 @@ async def ensure_consumer_groups(redis: Redis) -> None:
 
 
 async def process_plan_message(fields: dict[str, str], redis: Redis | None = None) -> list[UUID]:
-    packet = ContextPacket.model_validate_json(fields["packet"])
-    decision = decide(packet)
-    async with async_session_factory() as database_session:
-        tasks = await create_tasks_for_decision(
-            database_session,
-            packet=packet,
-            decision=decision,
-        )
+    with trace_scope(
+        "agent.plan.consume",
+        {
+            "event_type": "turn.finalized",
+            "trace_context_missing": "traceparent" not in fields,
+        },
+        parent=extract_trace_context(fields),
+    ):
+        packet = ContextPacket.model_validate_json(fields["packet"])
+        decision = decide(packet)
+        async with async_session_factory() as database_session:
+            tasks = await create_tasks_for_decision(
+                database_session,
+                packet=packet,
+                decision=decision,
+            )
 
     # task.queued outbox events are delivered to travel.tasks by app.outbox.
     return [task.id for task in tasks]
 
 
 async def process_compose_message(fields: dict[str, str]) -> bool:
-    async with async_session_factory() as database_session:
-        result = await compose_reply(
-            database_session,
-            session_id=UUID(fields["session_id"]),
-            turn_id=UUID(fields["turn_id"]),
-            context_version=int(fields["context_version"]),
-        )
-    if result.reply is not None:
-        return True
-    if not result.itinerary_conflict:
-        return False
+    with trace_scope(
+        "agent.compose.consume",
+        {
+            "event_type": "task.succeeded",
+            "trace_context_missing": "traceparent" not in fields,
+        },
+        parent=extract_trace_context(fields),
+    ):
+        async with async_session_factory() as database_session:
+            result = await compose_reply(
+                database_session,
+                session_id=UUID(fields["session_id"]),
+                turn_id=UUID(fields["turn_id"]),
+                context_version=int(fields["context_version"]),
+            )
+        if result.reply is not None:
+            return True
+        if not result.itinerary_conflict:
+            return False
 
-    async with async_session_factory() as database_session:
-        packet = await build_context_packet(
-            database_session,
-            session_id=UUID(fields["session_id"]),
-            turn_id=UUID(fields["turn_id"]),
-            context_version=int(fields["context_version"]),
-        )
-    async with async_session_factory() as database_session:
-        await create_tasks_for_decision(
-            database_session,
-            packet=packet,
-            decision=decide(packet),
-        )
-    return False
+        async with async_session_factory() as database_session:
+            packet = await build_context_packet(
+                database_session,
+                session_id=UUID(fields["session_id"]),
+                turn_id=UUID(fields["turn_id"]),
+                context_version=int(fields["context_version"]),
+            )
+        async with async_session_factory() as database_session:
+            await create_tasks_for_decision(
+                database_session,
+                packet=packet,
+                decision=decide(packet),
+            )
+        return False
 
 
 async def main() -> None:
+    settings.validate_runtime_config(expected_service_role="agent-worker")
+    from app.observability import bootstrap_observability
+
+    bootstrap_observability()
     redis = Redis.from_url(
         settings.redis_url,
         decode_responses=True,
@@ -107,7 +128,6 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

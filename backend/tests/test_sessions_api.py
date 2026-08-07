@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from collections.abc import AsyncIterator
 from uuid import UUID
 
 import httpx
@@ -8,8 +9,10 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.config import settings
 from app.db import async_session_factory, engine
-from app.main import app
+from app.main import app, get_realtime_redis
 from app.models import EventOutbox, Preference, Task, TravelSession, Turn
+from tests.auth import auth_headers
+from tests.fakes import FakeRedis
 
 
 class SessionApiTests(unittest.IsolatedAsyncioTestCase):
@@ -19,13 +22,21 @@ class SessionApiTests(unittest.IsolatedAsyncioTestCase):
         except Exception as error:  # pragma: no cover - environment-dependent
             self.skipTest(f"database unavailable: {error}")
 
+        self.redis = FakeRedis()
+
+        async def override() -> AsyncIterator[FakeRedis]:
+            yield self.redis
+
+        app.dependency_overrides[get_realtime_redis] = override
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
             base_url="http://testserver",
+            headers=auth_headers(),
         )
         self._created_session_ids: list[UUID] = []
 
     async def asyncTearDown(self) -> None:
+        app.dependency_overrides.pop(get_realtime_redis, None)
         await self.client.aclose()
         if self._created_session_ids:
             await self._delete_sessions(self._created_session_ids)

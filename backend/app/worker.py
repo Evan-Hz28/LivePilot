@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import socket
+import time
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -15,11 +16,12 @@ from app.config import settings
 from app.db import async_session_factory
 from app.models import EventOutbox, Preference, Task, ToolCall, TravelSession
 from app.tools import mock_travel_adapter
+from app.metrics import errors_total, task_completion_seconds, task_queue_wait_seconds, tasks_discarded_total, tool_call_seconds
+from app.observability import extract_trace_context, trace_scope
 TASK_STREAM = "travel.tasks"
 GROUP_NAME = "livepilot-workers"
 CONSUMER_NAME = f"{socket.gethostname()}-worker"
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -180,10 +182,28 @@ async def _finish_tool_call(
         )
 
 
-async def process_task(task_id: UUID, redis: Redis | None = None) -> None:
+async def process_task(
+    task_id: UUID,
+    redis: Redis | None = None,
+    trace_fields: dict[str, str] | None = None,
+) -> None:
+    with trace_scope(
+        "task.consume",
+        {
+            "event_type": "task.queued",
+            "trace_context_missing": not trace_fields or "traceparent" not in trace_fields,
+        },
+        parent=extract_trace_context(trace_fields or {}),
+    ):
+        await _process_task(task_id, redis)
+
+
+async def _process_task(task_id: UUID, redis: Redis | None = None) -> None:
     task_type: str | None = None
     tool_call_id: UUID | None = None
     tool_input: dict | None = None
+    task_created_at: datetime | None = None
+    attempt = 0
     async with async_session_factory() as database_session:
         async with database_session.begin():
             _, task = await _lock_task_and_session(database_session, task_id)
@@ -222,6 +242,12 @@ async def process_task(task_id: UUID, redis: Redis | None = None) -> None:
                 dedupe_key=f"task.running:{task.id}",
             )
             task_type = task.task_type
+            task_created_at = task.created_at
+            attempt = task.attempt
+            if task_created_at is not None:
+                task_queue_wait_seconds.labels(task_type, "started").observe(
+                    max(0, (now - task_created_at).total_seconds())
+                )
             if task_type == mock_travel_adapter.tool_name:
                 if (
                     task.context_version is None
@@ -252,7 +278,15 @@ async def process_task(task_id: UUID, redis: Redis | None = None) -> None:
         if task_type == "smoke_test":
             result = {"message": "worker ok"}
         elif task_type == mock_travel_adapter.tool_name and tool_input is not None:
-            result = await mock_travel_adapter.execute(tool_input)
+            tool_started = time.monotonic()
+            with trace_scope(
+                "tool.call",
+                {"tool_name": mock_travel_adapter.tool_name, "attempt": attempt},
+            ):
+                result = await mock_travel_adapter.execute(tool_input)
+            tool_call_seconds.labels(
+                mock_travel_adapter.tool_name, "succeeded", str(attempt)
+            ).observe(time.monotonic() - tool_started)
         else:
             raise ValueError(f"Unsupported task type: {task_type}")
 
@@ -275,6 +309,7 @@ async def process_task(task_id: UUID, redis: Redis | None = None) -> None:
                     or task.status in {"cancel_requested", "cancelled"}
                 ):
                     task.status = "discarded"
+                    tasks_discarded_total.inc()
                     await _finish_tool_call(
                         database_session,
                         tool_call_id=tool_call_id,
@@ -293,6 +328,10 @@ async def process_task(task_id: UUID, redis: Redis | None = None) -> None:
                         },
                         dedupe_key=f"task.discarded:{task.id}",
                     )
+                    if task_created_at is not None and task_type is not None:
+                        task_completion_seconds.labels(task_type, "discarded").observe(
+                            max(0, (finished_at - task_created_at).total_seconds())
+                        )
                     return
 
                 task.status = "succeeded"
@@ -314,10 +353,15 @@ async def process_task(task_id: UUID, redis: Redis | None = None) -> None:
                     },
                     dedupe_key=f"task.succeeded:{task.id}",
                 )
+                if task_created_at is not None and task_type is not None:
+                    task_completion_seconds.labels(task_type, "succeeded").observe(
+                        max(0, (finished_at - task_created_at).total_seconds())
+                    )
 
         # task.succeeded outbox events are delivered to agent.compose by app.outbox.
-        logger.info("task succeeded: %s", task_id)
-    except Exception as error:
+        logger.info("task succeeded", extra={"task_id": task_id})
+    except Exception:
+        errors_total.labels("TASK_EXECUTION_FAILED").inc()
         async with async_session_factory() as database_session:
             async with database_session.begin():
                 _, task = await _lock_task_and_session(database_session, task_id)
@@ -349,27 +393,37 @@ async def process_task(task_id: UUID, redis: Redis | None = None) -> None:
                 }:
                     finished_at = datetime.now(timezone.utc)
                     task.status = "failed"
-                    task.error_message = str(error)
+                    task.error_message = "Task execution failed"
                     task.finished_at = finished_at
                     await _finish_tool_call(
                         database_session,
                         tool_call_id=tool_call_id,
                         status="failed",
                         finished_at=finished_at,
-                        error_message=str(error),
+                        error_message="Task execution failed",
                     )
                     await _append_task_event(
                         database_session,
                         session_id=task.session_id,
                         event_type="task.failed",
-                        payload={"task_id": str(task.id), "error": str(error)},
+                        payload={
+                            "task_id": str(task.id),
+                            "error_code": "TASK_EXECUTION_FAILED",
+                        },
                         dedupe_key=f"task.failed:{task.id}",
                     )
 
-        logger.exception("task failed: %s", task_id)
+        logger.exception(
+            "task failed",
+            extra={"task_id": task_id, "error_code": "TASK_EXECUTION_FAILED"},
+        )
 
 
 async def main() -> None:
+    settings.validate_runtime_config(expected_service_role="task-worker")
+    from app.observability import bootstrap_observability
+
+    bootstrap_observability()
     redis = Redis.from_url(
         settings.redis_url,
         decode_responses=True,
@@ -392,7 +446,7 @@ async def main() -> None:
 
             for _, entries in messages:
                 for message_id, fields in entries:
-                    await process_task(UUID(fields["task_id"]), redis)
+                    await process_task(UUID(fields["task_id"]), redis, fields)
                     await redis.xack(TASK_STREAM, GROUP_NAME, message_id)
     finally:
         await redis.aclose()

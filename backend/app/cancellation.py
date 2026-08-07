@@ -24,7 +24,10 @@ async def write_task_cancel_keys(redis: Redis, task_ids: Iterable[UUID]) -> None
             )
         except RedisError:
             # PostgreSQL task state is authoritative; this key only shortens cancellation latency.
-            logger.warning("could not write cancellation key for task %s", task_id)
+            logger.warning(
+                "could not write cancellation key",
+                extra={"task_id": task_id, "error_code": "CANCEL_KEY_WRITE"},
+            )
 
 
 async def has_task_cancel_key(redis: Redis | None, task_id: UUID) -> bool:
@@ -33,5 +36,8 @@ async def has_task_cancel_key(redis: Redis | None, task_id: UUID) -> bool:
     try:
         return bool(await redis.exists(task_cancel_key(task_id)))
     except RedisError:
-        logger.warning("could not read cancellation key for task %s", task_id)
+        logger.warning(
+            "could not read cancellation key",
+            extra={"task_id": task_id, "error_code": "CANCEL_KEY_READ"},
+        )
         return False

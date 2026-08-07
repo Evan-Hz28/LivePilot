@@ -105,11 +105,29 @@ const API_BASE = (
 ).replace(/\/$/, '')
 const SESSION_STORAGE_KEY = 'livepilot.session_id'
 const DEVICE_STORAGE_KEY = 'livepilot.device_id'
+const ACCESS_TOKEN_STORAGE_KEY = 'livepilot.access_token'
+
+function traceparent() {
+  const bytes = crypto.getRandomValues(new Uint8Array(24))
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+  return `00-${hex.slice(0, 32)}-${hex.slice(32)}-01`
+}
+
+function currentAccessToken() {
+  return sessionStorage.getItem(ACCESS_TOKEN_STORAGE_KEY)?.trim() ?? ''
+}
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
+  const accessToken = currentAccessToken()
+  if (!accessToken) throw new Error('需要登录凭据')
   const response = await fetch(`${API_BASE}${path}`, {
     ...options,
-    headers: { 'Content-Type': 'application/json', ...(options?.headers ?? {}) },
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${accessToken}`,
+      traceparent: traceparent(),
+      ...(options?.headers ?? {}),
+    },
   })
   if (!response.ok) {
     const detail = await response.text()
@@ -163,6 +181,7 @@ function App() {
   const [sessionId, setSessionId] = useState(() => localStorage.getItem(SESSION_STORAGE_KEY))
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null)
   const [destination, setDestination] = useState('')
+  const [accessToken, setAccessToken] = useState(() => currentAccessToken())
   const [draft, setDraft] = useState('')
   const [loading, setLoading] = useState(false)
   const [submitting, setSubmitting] = useState(false)
@@ -242,7 +261,16 @@ function App() {
     const connect = () => {
       if (stopped) return
       setConnection('connecting')
-      socket = new WebSocket(websocketUrl(sessionId, cursorRef.current))
+      const token = currentAccessToken()
+      if (!token) {
+        setConnection('offline')
+        setError('需要登录凭据')
+        return
+      }
+      socket = new WebSocket(
+        websocketUrl(sessionId, cursorRef.current),
+        ['livepilot', `bearer.${token}`],
+      )
       socket.onopen = () => setConnection('live')
       socket.onmessage = (message) => {
         try {
@@ -289,6 +317,12 @@ function App() {
     } finally {
       setLoading(false)
     }
+  }
+
+  function updateAccessToken(value: string) {
+    setAccessToken(value)
+    if (value.trim()) sessionStorage.setItem(ACCESS_TOKEN_STORAGE_KEY, value.trim())
+    else sessionStorage.removeItem(ACCESS_TOKEN_STORAGE_KEY)
   }
 
   const submitTurnText = useCallback(async (text: string) => {
@@ -493,6 +527,14 @@ function App() {
             <p>目的地、偏好和每一次建议都会留在同一个上下文里。</p>
           </div>
           <div className="create-form">
+            <label htmlFor="access-token">访问令牌</label>
+            <input
+              id="access-token"
+              type="password"
+              autoComplete="off"
+              value={accessToken}
+              onChange={(event) => updateAccessToken(event.target.value)}
+            />
             <label htmlFor="destination">目的地 <span>可选</span></label>
             <input
               id="destination"
@@ -503,7 +545,7 @@ function App() {
                 if (event.key === 'Enter') void createSession()
               }}
             />
-            <button type="button" className="primary-button" onClick={() => void createSession()} disabled={loading}>
+            <button type="button" className="primary-button" onClick={() => void createSession()} disabled={loading || !accessToken.trim()}>
               {loading ? '正在创建…' : '创建会话'} <span aria-hidden="true">→</span>
             </button>
           </div>

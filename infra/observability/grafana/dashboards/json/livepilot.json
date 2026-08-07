@@ -1,0 +1,17 @@
+{
+  "title": "LivePilot Operations",
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Task completion",
+      "targets": [{"expr": "rate(livepilot_task_completion_seconds_count[5m])"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Outbox failures",
+      "targets": [{"expr": "rate(livepilot_outbox_publish_failures_total[5m])"}]
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}

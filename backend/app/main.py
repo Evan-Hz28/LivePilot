@@ -1,7 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from collections.abc import AsyncIterator
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
@@ -10,24 +9,59 @@ from fastapi import (
     FastAPI,
     HTTPException,
     Query,
+    Request,
     WebSocket,
     WebSocketDisconnect,
     status,
 )
 from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
+from fastapi.responses import Response
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from pydantic import BaseModel, ConfigDict, Field
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 from sqlalchemy import Select, select, update
 
+from app.auth import (
+    AuthenticationError,
+    CurrentPrincipal,
+    SessionOwner,
+    authenticate_websocket,
+    get_or_create_principal,
+    websocket_session_is_owned,
+)
+from app.input_validation import validate_json_value
 from app.config import settings
 from app.cancellation import write_task_cancel_keys
 from app.db import async_session_factory
+from app.main_dependencies import RealtimeRedis, get_realtime_redis
+from app.rate_limit import (
+    CreateSessionRateLimit,
+    ReadSessionRateLimit,
+    WriteSessionRateLimit,
+    enforce_rate_limit,
+)
+from app.metrics import (
+    errors_total,
+    interrupt_effective_seconds,
+    registry,
+    resume_conflicts_total,
+)
+from app.observability import (
+    bootstrap_observability,
+    current_traceparent,
+    extract_trace_context,
+    trace_scope,
+)
 from app.interrupts import InterruptResult, register_interrupt
 from app.models import (
     EventOutbox,
     Itinerary,
+    Principal,
     Preference,
     Task,
     ToolCall,
@@ -46,10 +80,14 @@ from app.realtime import (
 )
 
 TASK_STREAM = "travel.tasks"
+IDENTIFIER_PATTERN = r"^[A-Za-z0-9._:-]+$"
+ALLOWED_INTERRUPT_REASONS = {"user_interrupt", "voice_stopped", "user_cancelled"}
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    settings.validate_runtime_config(expected_service_role="api")
+    bootstrap_observability()
     publisher_task = asyncio.create_task(run_outbox_publisher())
     try:
         yield
@@ -59,65 +97,119 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="LivePilot API", lifespan=lifespan)
+FastAPIInstrumentor.instrument_app(app)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_cors_origins,
     allow_credentials=False,
     allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_headers=["Content-Type", "Authorization", "traceparent", "tracestate"],
 )
 
 
+@app.exception_handler(RequestValidationError)
+async def invalid_request(_: Request, __: RequestValidationError) -> JSONResponse:
+    errors_total.labels("REQUEST_VALIDATION").inc()
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        content={"detail": "Invalid request"},
+    )
+
+
+@app.middleware("http")
+async def enforce_request_body_limit(request, call_next):
+    if request.url.path == "/metrics" and request.headers.get("origin"):
+        return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content={"detail": "Not found"})
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
+    is_json_control_request = content_type == "application/json" and request.url.path != "/health"
+    content_length = request.headers.get("content-length")
+    if is_json_control_request and content_length is not None:
+        try:
+            body_size = int(content_length)
+        except ValueError:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"detail": "Invalid Content-Length"},
+            )
+        if body_size > settings.max_api_body_bytes:
+            return JSONResponse(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                content={"detail": "Request body exceeds the allowed limit"},
+            )
+    if is_json_control_request:
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > settings.max_api_body_bytes:
+                return JSONResponse(
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    content={"detail": "Request body exceeds the allowed limit"},
+                )
+        request._body = bytes(body)
+    return await call_next(request)
+
+
 class CreateSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     locale: str = Field(default="zh-CN", min_length=1, max_length=16)
     timezone: str = Field(default="Asia/Shanghai", min_length=1, max_length=64)
     preference: dict[str, Any] = Field(default_factory=dict)
 
 
 class PreferenceUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     base_context_version: int = Field(ge=0)
     patch: dict[str, Any] = Field(min_length=1)
-    client_event_id: str | None = Field(default=None, min_length=1, max_length=100)
+    client_event_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        pattern=IDENTIFIER_PATTERN,
+    )
     source_turn_id: UUID | None = None
 
 
 class FinalizeTurnRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     text: str = Field(min_length=1, max_length=20_000)
-    client_event_id: str | None = Field(default=None, min_length=1, max_length=100)
+    client_event_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        pattern=IDENTIFIER_PATTERN,
+    )
 
 
 class RealtimeTokenRequest(BaseModel):
-    device_id: str = Field(min_length=1, max_length=128)
+    model_config = ConfigDict(extra="forbid")
+    device_id: str = Field(min_length=1, max_length=128, pattern=IDENTIFIER_PATTERN)
 
 
 class RealtimeTokenRedeemRequest(BaseModel):
-    device_id: str = Field(min_length=1, max_length=128)
+    model_config = ConfigDict(extra="forbid")
+    device_id: str = Field(min_length=1, max_length=128, pattern=IDENTIFIER_PATTERN)
     token: str = Field(min_length=1, max_length=512)
 
 
 class InterruptRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     turn_id: UUID
     playback_id: str | None = Field(default=None, max_length=128)
     reason: str = Field(default="user_interrupt", min_length=1, max_length=64)
-    client_event_id: str | None = Field(default=None, min_length=1, max_length=100)
+    client_event_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        pattern=IDENTIFIER_PATTERN,
+    )
     occurred_at: datetime | None = None
 
 
 class ResumeSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     after_event_seq: int = Field(ge=0)
     previous_connection_epoch: int = Field(ge=0)
-    device_id: str = Field(min_length=1, max_length=128)
-
-
-async def get_realtime_redis() -> AsyncIterator[Redis]:
-    redis = Redis.from_url(settings.redis_url, decode_responses=True)
-    try:
-        yield redis
-    finally:
-        await redis.aclose()
-
-
-RealtimeRedis = Annotated[Redis, Depends(get_realtime_redis)]
+    device_id: str = Field(min_length=1, max_length=128, pattern=IDENTIFIER_PATTERN)
 
 
 def serialize_interrupt(result: InterruptResult) -> dict[str, object]:
@@ -138,6 +230,7 @@ async def handle_interrupt(
     redis: Redis,
 ) -> dict[str, object]:
     client_event_id = request.client_event_id or str(uuid4())
+    occurred_at = request.occurred_at or datetime.now(timezone.utc)
     async with async_session_factory() as database_session:
         result = await register_interrupt(
             database_session,
@@ -145,10 +238,13 @@ async def handle_interrupt(
             turn_id=request.turn_id,
             playback_id=request.playback_id,
             reason=request.reason,
-            occurred_at=request.occurred_at or datetime.now(timezone.utc),
+            occurred_at=occurred_at,
             client_event_id=client_event_id,
         )
     await write_task_cancel_keys(redis, result.cancelled_task_ids)
+    interrupt_effective_seconds.observe(
+        max(0, (datetime.now(timezone.utc) - occurred_at).total_seconds())
+    )
     return serialize_interrupt(result)
 
 
@@ -282,15 +378,27 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/metrics", include_in_schema=False)
+async def metrics() -> Response:
+    return Response(content=generate_latest(registry), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.post("/v1/sessions", status_code=status.HTTP_201_CREATED)
-async def create_session(request: CreateSessionRequest) -> dict[str, object]:
+async def create_session(
+    request: CreateSessionRequest,
+    identity: CurrentPrincipal,
+    _: CreateSessionRateLimit,
+) -> dict[str, object]:
     session_id = uuid4()
+    validate_json_value(request.preference)
 
     async with async_session_factory() as database_session:
         async with database_session.begin():
+            principal = await get_or_create_principal(database_session, identity)
             travel_session = TravelSession(
                 id=session_id,
-                user_id=uuid4(),
+                user_id=principal.id,
+                owner_principal_id=principal.id,
                 last_event_seq=1,
                 locale=request.locale,
                 timezone=request.timezone,
@@ -407,6 +515,8 @@ async def _load_session_snapshot(
 @app.get("/v1/sessions/{session_id}/snapshot")
 async def get_session_snapshot(
     session_id: UUID,
+    _: SessionOwner,
+    __: ReadSessionRateLimit,
     after_event_seq: int = Query(default=0, ge=0),
 ) -> dict[str, object]:
     return await _load_session_snapshot(session_id, after_event_seq)
@@ -417,6 +527,8 @@ async def create_realtime_token(
     session_id: UUID,
     request: RealtimeTokenRequest,
     redis: RealtimeRedis,
+    _: SessionOwner,
+    __: WriteSessionRateLimit,
 ) -> dict[str, object]:
     async with async_session_factory() as database_session:
         try:
@@ -448,6 +560,8 @@ async def redeem_session_realtime_token(
     session_id: UUID,
     request: RealtimeTokenRedeemRequest,
     redis: RealtimeRedis,
+    _: SessionOwner,
+    __: WriteSessionRateLimit,
 ) -> dict[str, object]:
     async with async_session_factory() as database_session:
         try:
@@ -482,6 +596,8 @@ async def resume_session(
     session_id: UUID,
     request: ResumeSessionRequest,
     redis: RealtimeRedis,
+    _: SessionOwner,
+    __: WriteSessionRateLimit,
 ) -> dict[str, object]:
     async with async_session_factory() as database_session:
         try:
@@ -495,6 +611,7 @@ async def resume_session(
         except LookupError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
         except RealtimeTokenEpochError as error:
+            resume_conflicts_total.inc()
             raise HTTPException(status_code=409, detail=str(error)) from error
         except RedisError as error:
             raise HTTPException(
@@ -517,8 +634,11 @@ async def resume_session(
 async def update_preferences(
     session_id: UUID,
     request: PreferenceUpdateRequest,
+    _: SessionOwner,
+    __: WriteSessionRateLimit,
 ) -> dict[str, object]:
     client_event_id = request.client_event_id or str(uuid4())
+    validate_json_value(request.patch)
     dedupe_key = f"preference.update:{session_id}:{client_event_id}"
 
     async with async_session_factory() as database_session:
@@ -653,7 +773,11 @@ async def interrupt_session(
     session_id: UUID,
     request: InterruptRequest,
     redis: RealtimeRedis,
+    _: SessionOwner,
+    __: WriteSessionRateLimit,
 ) -> dict[str, object]:
+    if request.reason not in ALLOWED_INTERRUPT_REASONS:
+        raise HTTPException(status_code=422, detail="Invalid interrupt reason")
     try:
         return await handle_interrupt(
             session_id=session_id,
@@ -675,7 +799,11 @@ async def interrupt_session(
 async def finalize_turn(
     session_id: UUID,
     request: FinalizeTurnRequest,
+    _: SessionOwner,
+    __: WriteSessionRateLimit,
 ) -> dict[str, object]:
+    if not request.text.strip():
+        raise HTTPException(status_code=422, detail="text must not be blank")
     client_event_id = request.client_event_id or str(uuid4())
     async with async_session_factory() as database_session:
         try:
@@ -712,6 +840,7 @@ def _snapshot_message(snapshot: dict[str, object]) -> dict[str, object]:
         "session_id": session_id,
         "payload": jsonable_encoder(snapshot),
         "snapshot": jsonable_encoder(snapshot),
+        "traceparent": current_traceparent(),
     }
 
 
@@ -724,6 +853,7 @@ def _event_message(event: dict[str, object]) -> dict[str, object]:
         "session_id": event["session_id"],
         "payload": event["payload"],
         "created_at": event["created_at"],
+        "traceparent": current_traceparent(),
     })
 
 
@@ -745,6 +875,50 @@ async def _send_snapshot_and_missed_events(
 @app.websocket("/v1/sessions/{session_id}/ws")
 async def session_events(websocket: WebSocket, session_id: UUID) -> None:
     try:
+        identity = authenticate_websocket(websocket)
+    except AuthenticationError:
+        await websocket.close(code=4401)
+        return
+    if not await websocket_session_is_owned(session_id, identity):
+        await websocket.close(code=1008, reason="Session not found")
+        return
+    origin = websocket.headers.get("origin")
+    if origin is not None and not settings.is_trusted_origin(origin):
+        await websocket.close(code=1008, reason="Origin not allowed")
+        return
+    redis = getattr(app.state, "websocket_redis", None)
+    owns_redis = redis is None
+    if redis is None:
+        redis = Redis.from_url(settings.redis_url, decode_responses=True)
+    try:
+        await enforce_rate_limit(
+            redis,
+            bucket="ws-connect",
+            limit=settings.rate_limit_ws_connect,
+            identity=identity,
+        )
+        await enforce_rate_limit(
+            redis,
+            bucket="ws-connect",
+            limit=settings.rate_limit_ws_connect,
+            identity=identity,
+            session_id=session_id,
+        )
+    except HTTPException as error:
+        await websocket.close(
+            code=1013,
+            reason=(
+                "Try again later"
+                if error.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+                else "Service unavailable"
+            ),
+        )
+        return
+    finally:
+        if owns_redis:
+            await redis.aclose()
+
+    try:
         after_event_seq = int(websocket.query_params.get("after_event_seq", "0"))
     except ValueError:
         await websocket.close(code=1008, reason="Invalid event cursor")
@@ -759,7 +933,13 @@ async def session_events(websocket: WebSocket, session_id: UUID) -> None:
         await websocket.close(code=1008, reason="Session not found")
         return
 
-    await websocket.accept()
+    requested_protocols = {
+        value.strip()
+        for value in websocket.headers.get("sec-websocket-protocol", "").split(",")
+    }
+    await websocket.accept(
+        subprotocol="livepilot" if "livepilot" in requested_protocols else None
+    )
     after_event_seq = await _send_snapshot_and_missed_events(websocket, snapshot)
 
     try:
@@ -772,6 +952,18 @@ async def session_events(websocket: WebSocket, session_id: UUID) -> None:
                 return
 
             if message is not None:
+                try:
+                    validate_json_value(message)
+                except HTTPException as error:
+                    await websocket.send_json(
+                        {"type": "error", "detail": error.detail}
+                    )
+                    continue
+                if not isinstance(message, dict):
+                    await websocket.send_json(
+                        {"type": "error", "detail": "Invalid event message"}
+                    )
+                    continue
                 message_type = message.get("type")
                 if message_type == "session.resume":
                     requested_seq = message.get("after_event_seq", after_event_seq)
@@ -788,26 +980,42 @@ async def session_events(websocket: WebSocket, session_id: UUID) -> None:
                     )
                 elif message_type == "turn.finalized":
                     payload = message.get("payload") or message
-                    text = payload.get("text")
-                    if not isinstance(text, str) or not text.strip():
+                    if not isinstance(payload, dict):
+                        await websocket.send_json(
+                            {"type": "error", "detail": "Invalid turn event"}
+                        )
+                        continue
+                    try:
+                        request = FinalizeTurnRequest.model_validate(payload)
+                    except ValueError:
+                        await websocket.send_json(
+                            {"type": "error", "detail": "Invalid turn event"}
+                        )
+                        continue
+                    if not request.text.strip():
                         await websocket.send_json(
                             {"type": "error", "detail": "text is required"}
                         )
                         continue
-                    client_event_id = payload.get("client_event_id") or str(uuid4())
-                    async with async_session_factory() as database_session:
-                        try:
-                            finalized = await finalize_text_turn(
-                                database_session,
-                                session_id=session_id,
-                                text=text,
-                                client_event_id=client_event_id,
-                            )
-                        except LookupError:
-                            await websocket.send_json(
-                                {"type": "error", "detail": "Session not found"}
-                            )
-                            continue
+                    client_event_id = request.client_event_id or str(uuid4())
+                    with trace_scope(
+                        "websocket.turn.finalized",
+                        {"event_type": "turn.finalized"},
+                        parent=extract_trace_context(message),
+                    ):
+                        async with async_session_factory() as database_session:
+                            try:
+                                finalized = await finalize_text_turn(
+                                    database_session,
+                                    session_id=session_id,
+                                    text=request.text,
+                                    client_event_id=client_event_id,
+                                )
+                            except LookupError:
+                                await websocket.send_json(
+                                    {"type": "error", "detail": "Session not found"}
+                                )
+                                continue
                     await websocket.send_json(
                         {
                             "type": "turn.accepted",
@@ -828,27 +1036,52 @@ async def session_events(websocket: WebSocket, session_id: UUID) -> None:
                         **(nested_payload if isinstance(nested_payload, dict) else {}),
                     }
                     try:
-                        request = InterruptRequest.model_validate(payload)
-                    except ValueError as error:
+                        request = InterruptRequest.model_validate(
+                            {
+                                name: payload[name]
+                                for name in (
+                                    "turn_id",
+                                    "playback_id",
+                                    "reason",
+                                    "client_event_id",
+                                    "occurred_at",
+                                )
+                                if name in payload
+                            }
+                        )
+                    except ValueError:
                         await websocket.send_json(
-                            {"type": "error", "detail": str(error)}
+                            {"type": "error", "detail": "Invalid interrupt event"}
+                        )
+                        continue
+                    if request.reason not in ALLOWED_INTERRUPT_REASONS:
+                        await websocket.send_json(
+                            {"type": "error", "detail": "Invalid interrupt reason"}
                         )
                         continue
 
-                    redis = Redis.from_url(settings.redis_url, decode_responses=True)
+                    redis = getattr(app.state, "websocket_redis", None)
+                    owns_redis = redis is None
+                    if redis is None:
+                        redis = Redis.from_url(settings.redis_url, decode_responses=True)
                     try:
-                        accepted = await handle_interrupt(
-                            session_id=session_id,
-                            request=request,
-                            redis=redis,
-                        )
+                        with trace_scope(
+                            "websocket.agent.interrupt",
+                            {"event_type": "agent.interrupt"},
+                            parent=extract_trace_context(message),
+                        ):
+                            accepted = await handle_interrupt(
+                                session_id=session_id,
+                                request=request,
+                                redis=redis,
+                            )
                     except LookupError:
                         await websocket.send_json(
                             {"type": "error", "detail": "Session not found"}
                         )
                     except ValueError as error:
                         await websocket.send_json(
-                            {"type": "error", "detail": str(error)}
+                            {"type": "error", "detail": "Invalid interrupt event"}
                         )
                     except RuntimeError as error:
                         await websocket.send_json(
@@ -864,7 +1097,12 @@ async def session_events(websocket: WebSocket, session_id: UUID) -> None:
                             }
                         )
                     finally:
-                        await redis.aclose()
+                        if owns_redis:
+                            await redis.aclose()
+                else:
+                    await websocket.send_json(
+                        {"type": "error", "detail": "Unsupported event type"}
+                    )
                 continue
 
             snapshot = await _load_session_snapshot(session_id, after_event_seq)
@@ -881,28 +1119,33 @@ async def session_events(websocket: WebSocket, session_id: UUID) -> None:
     "/demo/tasks/smoke-test",
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def create_smoke_test_task() -> dict[str, str]:
+async def create_smoke_test_task(
+    identity: CurrentPrincipal,
+    _: CreateSessionRateLimit,
+) -> dict[str, str]:
     session_id = uuid4()
     task_id = uuid4()
 
     async with async_session_factory() as database_session:
-        database_session.add(
-            TravelSession(
-                id=session_id,
-                user_id=uuid4(),
+        async with database_session.begin():
+            principal = await get_or_create_principal(database_session, identity)
+            database_session.add(
+                TravelSession(
+                    id=session_id,
+                    user_id=principal.id,
+                    owner_principal_id=principal.id,
+                )
             )
-        )
-        await database_session.flush()
+            await database_session.flush()
 
-        database_session.add(
-            Task(
-                id=task_id,
-                session_id=session_id,
-                task_type="smoke_test",
-                payload={},
+            database_session.add(
+                Task(
+                    id=task_id,
+                    session_id=session_id,
+                    task_type="smoke_test",
+                    payload={},
+                )
             )
-        )
-        await database_session.commit()
 
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
     try:
@@ -923,9 +1166,21 @@ async def create_smoke_test_task() -> dict[str, str]:
 
 
 @app.get("/demo/tasks/{task_id}")
-async def get_task(task_id: UUID) -> dict[str, object]:
+async def get_task(
+    task_id: UUID,
+    identity: CurrentPrincipal,
+) -> dict[str, object]:
     async with async_session_factory() as database_session:
-        task = await database_session.get(Task, task_id)
+        task = await database_session.scalar(
+            select(Task)
+            .join(TravelSession, Task.session_id == TravelSession.id)
+            .join(Principal, TravelSession.owner_principal_id == Principal.id)
+            .where(
+                Task.id == task_id,
+                Principal.issuer == identity.issuer,
+                Principal.subject == identity.subject,
+            )
+        )
 
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")

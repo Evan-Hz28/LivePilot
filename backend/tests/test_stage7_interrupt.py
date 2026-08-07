@@ -16,31 +16,8 @@ from app.db import async_session_factory, engine
 from app.main import app, get_realtime_redis
 from app.models import EventOutbox, Preference, Task, TravelSession, Turn
 from app.worker import process_task
-
-
-class FakeRedis:
-    def __init__(self) -> None:
-        self.values: dict[str, str] = {}
-
-    async def set(
-        self,
-        key: str,
-        value: str,
-        *,
-        ex: int,
-        nx: bool = False,
-    ) -> bool | None:
-        del ex
-        if nx and key in self.values:
-            return None
-        self.values[key] = value
-        return True
-
-    async def exists(self, key: str) -> int:
-        return int(key in self.values)
-
-    async def getdel(self, key: str) -> str | None:
-        return self.values.pop(key, None)
+from tests.auth import auth_headers
+from tests.fakes import FakeRedis
 
 
 class Stage7InterruptTests(unittest.IsolatedAsyncioTestCase):
@@ -59,6 +36,7 @@ class Stage7InterruptTests(unittest.IsolatedAsyncioTestCase):
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
             base_url="http://testserver",
+            headers=auth_headers(),
         )
         self.session_ids: list[UUID] = []
 

@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from collections.abc import AsyncIterator
 from uuid import UUID
 
 import httpx
@@ -10,9 +11,11 @@ from app.agent.service import build_context_packet
 from app.agent.worker import process_compose_message, process_plan_message
 from app.config import settings
 from app.db import async_session_factory, engine
-from app.main import app
+from app.main import app, get_realtime_redis
 from app.models import EventOutbox, Preference, Task, TravelSession, Turn
 from app.worker import process_task
+from tests.auth import auth_headers
+from tests.fakes import FakeRedis
 
 
 class Stage4AgentTests(unittest.IsolatedAsyncioTestCase):
@@ -21,13 +24,21 @@ class Stage4AgentTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(self._database_is_available(), timeout=3)
         except Exception as error:  # pragma: no cover - environment-dependent
             self.skipTest(f"database unavailable: {error}")
+        self.redis = FakeRedis()
+
+        async def override() -> AsyncIterator[FakeRedis]:
+            yield self.redis
+
+        app.dependency_overrides[get_realtime_redis] = override
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
             base_url="http://testserver",
+            headers=auth_headers(),
         )
         self.session_ids: list[UUID] = []
 
     async def asyncTearDown(self) -> None:
+        app.dependency_overrides.pop(get_realtime_redis, None)
         await self.client.aclose()
         if self.session_ids:
             async with async_session_factory() as database_session:

@@ -19,9 +19,29 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PostgresUUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from app.observability import current_traceparent
+
 
 class Base(DeclarativeBase):
     pass
+
+
+class Principal(Base):
+    __tablename__ = "principals"
+    __table_args__ = (UniqueConstraint("issuer", "subject"),)
+
+    id: Mapped[UUID] = mapped_column(
+        PostgresUUID(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+    )
+    issuer: Mapped[str] = mapped_column(String(512), nullable=False)
+    subject: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
 
 
 class TravelSession(Base):
@@ -34,6 +54,13 @@ class TravelSession(Base):
     )
     user_id: Mapped[UUID] = mapped_column(
         PostgresUUID(as_uuid=True),
+        nullable=False,
+        index=True,
+    )
+    # Retained for migration compatibility. Authorization uses owner_principal_id.
+    owner_principal_id: Mapped[UUID] = mapped_column(
+        PostgresUUID(as_uuid=True),
+        ForeignKey("principals.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
@@ -312,6 +339,11 @@ class EventOutbox(Base):
     dedupe_key: Mapped[str] = mapped_column(
         String(160),
         nullable=False,
+    )
+    traceparent: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+        default=current_traceparent,
     )
     published_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),

@@ -10,6 +10,8 @@ from uuid import UUID, uuid4
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.input_validation import validate_json_value
+from app.metrics import tasks_discarded_total
 from app.models import (
     EventOutbox,
     Itinerary,
@@ -310,6 +312,7 @@ async def create_tasks_for_decision(
             return []
 
         for plan in decision.tasks:
+            validate_json_value(plan.payload)
             key = task_idempotency_key(
                 session_id=packet.session_id,
                 context_version=packet.context_version,
@@ -452,6 +455,7 @@ async def compose_reply(
         if current_itinerary_version != expected_itinerary_version:
             for task in tasks:
                 task.status = "discarded"
+                tasks_discarded_total.inc()
                 session.last_event_seq += 1
                 database_session.add(
                     EventOutbox(
