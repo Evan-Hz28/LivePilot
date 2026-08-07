@@ -3,6 +3,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    ARRAY,
     BigInteger,
     DateTime,
     ForeignKey,
@@ -106,6 +107,10 @@ class Task(Base):
         nullable=True,
     )
     target_preference_version: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+    target_itinerary_version: Mapped[int | None] = mapped_column(
         Integer,
         nullable=True,
     )
@@ -316,4 +321,105 @@ class EventOutbox(Base):
         DateTime(timezone=True),
         nullable=False,
         server_default=func.now(),
+    )
+
+
+class ToolCall(Base):
+    __tablename__ = "tool_calls"
+    __table_args__ = (
+        UniqueConstraint("task_id", "tool_name", "request_hash"),
+        Index("idx_tool_calls_session_id", "session_id"),
+        Index("idx_tool_calls_task", "task_id", "created_at"),
+        Index("idx_tool_calls_session_context", "session_id", "context_version"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PostgresUUID(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+    )
+    task_id: Mapped[UUID] = mapped_column(
+        PostgresUUID(as_uuid=True),
+        ForeignKey("tasks.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    session_id: Mapped[UUID] = mapped_column(
+        PostgresUUID(as_uuid=True),
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    context_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    target_preference_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    tool_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        server_default="pending",
+    )
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    input: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    output: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    provider_request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class Itinerary(Base):
+    __tablename__ = "itineraries"
+    __table_args__ = (
+        UniqueConstraint("session_id", "version"),
+        Index("idx_itineraries_session_id", "session_id"),
+        Index(
+            "uq_confirmed_itinerary_per_session",
+            "session_id",
+            unique=True,
+            postgresql_where=text("status = 'confirmed'"),
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PostgresUUID(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+    )
+    session_id: Mapped[UUID] = mapped_column(
+        PostgresUUID(as_uuid=True),
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    context_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    preference_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        server_default="draft",
+    )
+    content: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    budget_summary: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+    )
+    source_task_ids: Mapped[list[UUID]] = mapped_column(
+        ARRAY(PostgresUUID(as_uuid=True)),
+        nullable=False,
+        default=list,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    confirmed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
     )

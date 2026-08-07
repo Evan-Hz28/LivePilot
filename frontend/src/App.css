@@ -84,6 +84,14 @@ button { cursor: pointer; }
 .task-status.succeeded { color: var(--teal); background: var(--teal-soft); }
 .task-status.failed { color: #ae3f32; background: #fae8e3; }
 .task-status.discarded { color: #8f6d1c; background: #fbf0cf; }
+.task-status.cancelled { color: #8f6d1c; background: #fbf0cf; }
+.itinerary-body { padding: 18px 23px 21px; }
+.itinerary-destination { margin: 0; font-size: 17px; font-weight: 700; }
+.itinerary-meta { margin: 6px 0 12px; color: var(--muted); font: 10px/1.4 var(--mono); }
+.itinerary-list { margin: 0; padding: 0; list-style: none; }
+.itinerary-list li { display: flex; justify-content: space-between; gap: 14px; padding: 11px 0; border-top: 1px solid #e8ece6; }
+.itinerary-list strong { font-size: 13px; line-height: 1.4; }
+.itinerary-list span { color: var(--muted); font: 10px/1.4 var(--mono); text-transform: uppercase; }
 .reply-panel { padding: 23px; color: var(--white); background: var(--ink); }
 .reply-panel .section-kicker { color: var(--yellow); }
 .reply-panel h2 { margin-top: 12px; color: var(--white); }

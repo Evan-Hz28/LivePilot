@@ -25,7 +25,15 @@ from app.config import settings
 from app.cancellation import write_task_cancel_keys
 from app.db import async_session_factory
 from app.interrupts import InterruptResult, register_interrupt
-from app.models import EventOutbox, Preference, Task, TravelSession, Turn
+from app.models import (
+    EventOutbox,
+    Itinerary,
+    Preference,
+    Task,
+    ToolCall,
+    TravelSession,
+    Turn,
+)
 from app.agent.service import (
     finalize_text_turn,
 )
@@ -198,6 +206,7 @@ def serialize_task(task: Task) -> dict[str, object]:
         "status": task.status,
         "context_version": task.context_version,
         "target_preference_version": task.target_preference_version,
+        "target_itinerary_version": task.target_itinerary_version,
         "idempotency_key": task.idempotency_key,
         "payload": task.payload,
         "result": task.result,
@@ -207,6 +216,44 @@ def serialize_task(task: Task) -> dict[str, object]:
         "created_at": task.created_at,
         "started_at": task.started_at,
         "finished_at": task.finished_at,
+    }
+
+
+def serialize_tool_call(tool_call: ToolCall) -> dict[str, object]:
+    return {
+        "tool_call_id": str(tool_call.id),
+        "task_id": str(tool_call.task_id),
+        "session_id": str(tool_call.session_id),
+        "context_version": tool_call.context_version,
+        "target_preference_version": tool_call.target_preference_version,
+        "tool_name": tool_call.tool_name,
+        "status": tool_call.status,
+        "request_hash": tool_call.request_hash,
+        "input": tool_call.input,
+        "output": tool_call.output,
+        "provider_request_id": tool_call.provider_request_id,
+        "error_code": tool_call.error_code,
+        "error_message": tool_call.error_message,
+        "latency_ms": tool_call.latency_ms,
+        "started_at": tool_call.started_at,
+        "finished_at": tool_call.finished_at,
+        "created_at": tool_call.created_at,
+    }
+
+
+def serialize_itinerary(itinerary: Itinerary) -> dict[str, object]:
+    return {
+        "itinerary_id": str(itinerary.id),
+        "session_id": str(itinerary.session_id),
+        "version": itinerary.version,
+        "context_version": itinerary.context_version,
+        "preference_version": itinerary.preference_version,
+        "status": itinerary.status,
+        "content": itinerary.content,
+        "budget_summary": itinerary.budget_summary,
+        "source_task_ids": [str(task_id) for task_id in itinerary.source_task_ids],
+        "created_at": itinerary.created_at,
+        "confirmed_at": itinerary.confirmed_at,
     }
 
 
@@ -307,6 +354,21 @@ async def _load_session_snapshot(
                 )
             ).all()
         )
+        tool_calls = list(
+            (
+                await database_session.scalars(
+                    select(ToolCall)
+                    .where(ToolCall.session_id == session_id)
+                    .order_by(ToolCall.created_at)
+                )
+            ).all()
+        )
+        itinerary = await database_session.scalar(
+            select(Itinerary).where(
+                Itinerary.session_id == session_id,
+                Itinerary.status == "confirmed",
+            )
+        )
         events = list(
             (
                 await database_session.scalars(
@@ -327,10 +389,16 @@ async def _load_session_snapshot(
         else None,
         "turns": [serialize_turn(turn) for turn in turns],
         "tasks": [serialize_task(task) for task in tasks],
-        "itinerary": {
-            "status": "not_created",
-            "context_version": travel_session.context_version,
-        },
+        "tool_calls": [serialize_tool_call(tool_call) for tool_call in tool_calls],
+        "itinerary": (
+            serialize_itinerary(itinerary)
+            if itinerary is not None
+            else {
+                "status": "not_created",
+                "version": 0,
+                "context_version": travel_session.context_version,
+            }
+        ),
         "missed_events": [serialize_event(event) for event in events],
         "after_event_seq": after_event_seq,
     }

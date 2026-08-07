@@ -15,6 +15,7 @@ from .schemas import ContextPacket
 from .service import (
     AGENT_COMPOSE_STREAM,
     PLAN_STREAM,
+    build_context_packet,
     compose_reply,
     create_tasks_for_decision,
     decide,
@@ -50,13 +51,31 @@ async def process_plan_message(fields: dict[str, str], redis: Redis | None = Non
 
 async def process_compose_message(fields: dict[str, str]) -> bool:
     async with async_session_factory() as database_session:
-        reply = await compose_reply(
+        result = await compose_reply(
             database_session,
             session_id=UUID(fields["session_id"]),
             turn_id=UUID(fields["turn_id"]),
             context_version=int(fields["context_version"]),
         )
-    return reply is not None
+    if result.reply is not None:
+        return True
+    if not result.itinerary_conflict:
+        return False
+
+    async with async_session_factory() as database_session:
+        packet = await build_context_packet(
+            database_session,
+            session_id=UUID(fields["session_id"]),
+            turn_id=UUID(fields["turn_id"]),
+            context_version=int(fields["context_version"]),
+        )
+    async with async_session_factory() as database_session:
+        await create_tasks_for_decision(
+            database_session,
+            packet=packet,
+            decision=decide(packet),
+        )
+    return False
 
 
 async def main() -> None:

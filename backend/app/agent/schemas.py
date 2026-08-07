@@ -18,6 +18,7 @@ class ContextPacket(BaseModel):
     turn_id: UUID
     context_version: int
     preference_version: int
+    itinerary_version: int
     preference: dict
     recent_turns: list[ContextTurn]
     user_text: str
@@ -40,3 +41,5 @@ class ReplyContext(BaseModel):
     preference_version: int
     source_task_ids: list[UUID]
     tool_results: list[dict]
+    itinerary_version: int | None = None
+    source_tool_call_ids: list[UUID] = Field(default_factory=list)

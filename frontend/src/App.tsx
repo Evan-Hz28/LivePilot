@@ -5,6 +5,7 @@ import {
   type RealtimeConnectionState,
   type RealtimeProviderConfig,
 } from './realtime/mockRealtime'
+import { itineraryItems, type ItineraryContent } from './itinerary'
 
 type Session = {
   session_id: string
@@ -43,8 +44,30 @@ type Task = {
   task_type: string
   status: string
   context_version: number | null
+  target_itinerary_version: number | null
   result?: Record<string, unknown> | null
   error_message?: string | null
+}
+
+type ToolCall = {
+  tool_call_id: string
+  task_id: string
+  tool_name: string
+  status: string
+  context_version: number
+  target_preference_version: number
+  output?: Record<string, unknown> | null
+  error_message?: string | null
+}
+
+type Itinerary = {
+  itinerary_id?: string
+  status: string
+  version: number
+  context_version: number
+  preference_version?: number
+  content?: ItineraryContent
+  source_task_ids?: string[]
 }
 
 type Snapshot = {
@@ -52,7 +75,8 @@ type Snapshot = {
   active_preference: Preference | null
   turns: Turn[]
   tasks: Task[]
-  itinerary: { status: string; context_version: number }
+  tool_calls: ToolCall[]
+  itinerary: Itinerary
   missed_events: Array<Record<string, unknown>>
   after_event_seq: number
 }
@@ -113,6 +137,18 @@ function taskLabel(status: string) {
   }[status] ?? status
 }
 
+function toolLabel(status: string) {
+  return {
+    pending: '等待调用',
+    running: '查询中',
+    succeeded: '已完成',
+    failed: '失败',
+    timed_out: '超时',
+    cancelled: '已取消',
+    discarded: '已过期',
+  }[status] ?? status
+}
+
 function voiceLabel(state: VoiceState) {
   return {
     idle: '未连接',
@@ -161,6 +197,10 @@ function App() {
       (task) => task.turn_id && ['queued', 'running', 'cancel_requested'].includes(task.status),
     ),
     [snapshot?.tasks],
+  )
+  const confirmedItineraryItems = useMemo(
+    () => itineraryItems(snapshot?.itinerary.content),
+    [snapshot?.itinerary.content],
   )
 
   const loadSnapshot = useCallback(async (id: string, after = 0) => {
@@ -444,7 +484,7 @@ function App() {
             <p className="eyebrow">LIVEPILOT / SESSION CONTROL</p>
             <h1>你的下一段旅程，从这里开始。</h1>
           </div>
-          <span className="build-tag">STAGE 06</span>
+          <span className="build-tag">STAGE 08</span>
         </header>
         <section className="create-band">
           <div className="create-copy">
@@ -544,6 +584,14 @@ function App() {
           <section className="panel task-panel">
             <div className="panel-heading"><div><span className="section-kicker">ASYNC WORK</span><h2>任务进度</h2></div><span className="record-count">{snapshot.tasks.length}</span></div>
             {snapshot.tasks.length === 0 ? <p className="muted">提交文本后，异步任务会出现在这里。</p> : <div className="task-list">{snapshot.tasks.map((task) => <div className="task-row" key={task.task_id}><div><strong>{task.task_type}</strong><small>context v{task.context_version ?? '—'}</small></div><span className={`task-status ${task.status}`}>{taskLabel(task.status)}</span></div>)}</div>}
+          </section>
+          <section className="panel tool-panel">
+            <div className="panel-heading"><div><span className="section-kicker">TOOL AUDIT</span><h2>工具调用</h2></div><span className="record-count">{snapshot.tool_calls.length}</span></div>
+            {snapshot.tool_calls.length === 0 ? <p className="muted">工具调用会在 Worker 开始查询后记录在这里。</p> : <div className="task-list">{snapshot.tool_calls.map((toolCall) => <div className="task-row" key={toolCall.tool_call_id}><div><strong>{toolCall.tool_name}</strong><small>context v{toolCall.context_version} · preference v{toolCall.target_preference_version}</small></div><span className={`task-status ${toolCall.status}`}>{toolLabel(toolCall.status)}</span></div>)}</div>}
+          </section>
+          <section className="panel itinerary-panel">
+            <div className="panel-heading"><div><span className="section-kicker">CONFIRMED ITINERARY</span><h2>当前行程</h2></div><span className="version-badge">v{snapshot.itinerary.version}</span></div>
+            {snapshot.itinerary.status === 'not_created' ? <p className="muted">完成工具查询后，权威行程会在这里恢复。</p> : <div className="itinerary-body"><p className="itinerary-destination">{snapshot.itinerary.content?.destination ?? '当前目的地'}</p><p className="itinerary-meta">context v{snapshot.itinerary.context_version} · preference v{snapshot.itinerary.preference_version ?? '—'}</p>{confirmedItineraryItems.length === 0 ? <p className="muted">当前行程还没有可展示的项目。</p> : <ul className="itinerary-list">{confirmedItineraryItems.map((item, index) => <li key={`${item.name ?? 'item'}-${index}`}><strong>{item.name ?? '未命名推荐'}</strong><span>{item.type ?? 'activity'}</span></li>)}</ul>}</div>}
           </section>
           <section className="reply-panel">
             <span className="section-kicker">LATEST REPLY</span>

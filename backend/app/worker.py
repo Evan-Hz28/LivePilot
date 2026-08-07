@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import logging
 import socket
 from datetime import datetime, timezone
@@ -11,7 +13,8 @@ from sqlalchemy import select
 from app.cancellation import has_task_cancel_key
 from app.config import settings
 from app.db import async_session_factory
-from app.models import EventOutbox, Preference, Task, TravelSession
+from app.models import EventOutbox, Preference, Task, ToolCall, TravelSession
+from app.tools import mock_travel_adapter
 TASK_STREAM = "travel.tasks"
 GROUP_NAME = "livepilot-workers"
 CONSUMER_NAME = f"{socket.gethostname()}-worker"
@@ -114,8 +117,24 @@ async def _mark_task_cancelled(task_id: UUID) -> bool:
             _, task = await _lock_task_and_session(database_session, task_id)
             if task is None or task.status != "cancel_requested":
                 return False
+            now = datetime.now(timezone.utc)
             task.status = "cancelled"
-            task.finished_at = datetime.now(timezone.utc)
+            task.finished_at = now
+            tool_calls = list(
+                (
+                    await database_session.scalars(
+                        select(ToolCall)
+                        .where(
+                            ToolCall.task_id == task.id,
+                            ToolCall.status.in_(("pending", "running")),
+                        )
+                        .with_for_update()
+                    )
+                ).all()
+            )
+            for tool_call in tool_calls:
+                tool_call.status = "cancelled"
+                tool_call.finished_at = now
             await _append_task_event(
                 database_session,
                 session_id=task.session_id,
@@ -130,22 +149,41 @@ async def _mark_task_cancelled(task_id: UUID) -> bool:
             return True
 
 
-def _mock_result(task: Task) -> dict:
-    destination = str(task.payload.get("destination") or "未指定目的地")
-    return {
-        "mock": True,
-        "tool": "mock_travel",
-        "destination": destination,
-        "recommendations": [
-            {"name": f"{destination}历史街区", "category": "culture"},
-            {"name": f"{destination}城市公园", "category": "outdoors"},
-        ],
-        "query": task.payload.get("query", ""),
-    }
+def _tool_request_hash(tool_input: dict) -> str:
+    canonical_input = json.dumps(tool_input, ensure_ascii=True, sort_keys=True)
+    return hashlib.sha256(canonical_input.encode("utf-8")).hexdigest()
+
+
+async def _finish_tool_call(
+    database_session,
+    *,
+    tool_call_id: UUID | None,
+    status: str,
+    finished_at: datetime,
+    output: dict | None = None,
+    error_message: str | None = None,
+) -> None:
+    if tool_call_id is None:
+        return
+    tool_call = await database_session.scalar(
+        select(ToolCall).where(ToolCall.id == tool_call_id).with_for_update()
+    )
+    if tool_call is None:
+        return
+    tool_call.status = status
+    tool_call.output = output
+    tool_call.error_message = error_message
+    tool_call.finished_at = finished_at
+    if tool_call.started_at is not None:
+        tool_call.latency_ms = int(
+            (finished_at - tool_call.started_at).total_seconds() * 1000
+        )
 
 
 async def process_task(task_id: UUID, redis: Redis | None = None) -> None:
     task_type: str | None = None
+    tool_call_id: UUID | None = None
+    tool_input: dict | None = None
     async with async_session_factory() as database_session:
         async with database_session.begin():
             _, task = await _lock_task_and_session(database_session, task_id)
@@ -168,9 +206,10 @@ async def process_task(task_id: UUID, redis: Redis | None = None) -> None:
                 return
             if task.status != "queued":
                 return
+            now = datetime.now(timezone.utc)
             task.status = "running"
             task.attempt += 1
-            task.started_at = datetime.now(timezone.utc)
+            task.started_at = now
             await _append_task_event(
                 database_session,
                 session_id=task.session_id,
@@ -183,6 +222,27 @@ async def process_task(task_id: UUID, redis: Redis | None = None) -> None:
                 dedupe_key=f"task.running:{task.id}",
             )
             task_type = task.task_type
+            if task_type == mock_travel_adapter.tool_name:
+                if (
+                    task.context_version is None
+                    or task.target_preference_version is None
+                ):
+                    raise ValueError("mock_travel task is missing fixed versions")
+                tool_input = dict(task.payload)
+                tool_call = ToolCall(
+                    task_id=task.id,
+                    session_id=task.session_id,
+                    context_version=task.context_version,
+                    target_preference_version=task.target_preference_version,
+                    tool_name=mock_travel_adapter.tool_name,
+                    status="running",
+                    request_hash=_tool_request_hash(tool_input),
+                    input=tool_input,
+                    started_at=now,
+                )
+                database_session.add(tool_call)
+                await database_session.flush()
+                tool_call_id = tool_call.id
 
     try:
         if await _task_cancellation_requested(task_id, redis):
@@ -191,12 +251,8 @@ async def process_task(task_id: UUID, redis: Redis | None = None) -> None:
 
         if task_type == "smoke_test":
             result = {"message": "worker ok"}
-        elif task_type == "mock_travel":
-            async with async_session_factory() as database_session:
-                task = await database_session.get(Task, task_id)
-                if task is None:
-                    return
-                result = _mock_result(task)
+        elif task_type == mock_travel_adapter.tool_name and tool_input is not None:
+            result = await mock_travel_adapter.execute(tool_input)
         else:
             raise ValueError(f"Unsupported task type: {task_type}")
 
@@ -209,8 +265,9 @@ async def process_task(task_id: UUID, redis: Redis | None = None) -> None:
 
                 cancelled_before_commit = await has_task_cancel_key(redis, task_id)
                 current = await _task_context_is_current(database_session, task)
+                finished_at = datetime.now(timezone.utc)
                 task.result = result
-                task.finished_at = datetime.now(timezone.utc)
+                task.finished_at = finished_at
                 if (
                     cancelled_after_execution
                     or cancelled_before_commit
@@ -218,6 +275,13 @@ async def process_task(task_id: UUID, redis: Redis | None = None) -> None:
                     or task.status in {"cancel_requested", "cancelled"}
                 ):
                     task.status = "discarded"
+                    await _finish_tool_call(
+                        database_session,
+                        tool_call_id=tool_call_id,
+                        status="discarded",
+                        finished_at=finished_at,
+                        output=result,
+                    )
                     await _append_task_event(
                         database_session,
                         session_id=task.session_id,
@@ -232,6 +296,13 @@ async def process_task(task_id: UUID, redis: Redis | None = None) -> None:
                     return
 
                 task.status = "succeeded"
+                await _finish_tool_call(
+                    database_session,
+                    tool_call_id=tool_call_id,
+                    status="succeeded",
+                    finished_at=finished_at,
+                    output=result,
+                )
                 await _append_task_event(
                     database_session,
                     session_id=task.session_id,
@@ -251,8 +322,15 @@ async def process_task(task_id: UUID, redis: Redis | None = None) -> None:
             async with database_session.begin():
                 _, task = await _lock_task_and_session(database_session, task_id)
                 if task is not None and task.status == "cancel_requested":
+                    finished_at = datetime.now(timezone.utc)
                     task.status = "cancelled"
-                    task.finished_at = datetime.now(timezone.utc)
+                    task.finished_at = finished_at
+                    await _finish_tool_call(
+                        database_session,
+                        tool_call_id=tool_call_id,
+                        status="cancelled",
+                        finished_at=finished_at,
+                    )
                     await _append_task_event(
                         database_session,
                         session_id=task.session_id,
@@ -269,9 +347,17 @@ async def process_task(task_id: UUID, redis: Redis | None = None) -> None:
                     "discarded",
                     "succeeded",
                 }:
+                    finished_at = datetime.now(timezone.utc)
                     task.status = "failed"
                     task.error_message = str(error)
-                    task.finished_at = datetime.now(timezone.utc)
+                    task.finished_at = finished_at
+                    await _finish_tool_call(
+                        database_session,
+                        tool_call_id=tool_call_id,
+                        status="failed",
+                        finished_at=finished_at,
+                        error_message=str(error),
+                    )
                     await _append_task_event(
                         database_session,
                         session_id=task.session_id,

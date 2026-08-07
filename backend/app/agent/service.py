@@ -10,7 +10,15 @@ from uuid import UUID, uuid4
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import EventOutbox, Preference, Task, TravelSession, Turn
+from app.models import (
+    EventOutbox,
+    Itinerary,
+    Preference,
+    Task,
+    ToolCall,
+    TravelSession,
+    Turn,
+)
 
 from .schemas import (
     AgentDecision,
@@ -35,6 +43,12 @@ class FinalizedTurn:
     preference_version: int
     event_seq: int
     client_event_id: str
+
+
+@dataclass(frozen=True)
+class ComposeResult:
+    reply: ReplyContext | None
+    itinerary_conflict: bool = False
 
 
 def _event_payload(event: EventOutbox) -> dict[str, Any]:
@@ -144,6 +158,12 @@ async def build_context_packet(
     else:
         preference_query = preference_query.where(Preference.version == preference_version)
     preference = await database_session.scalar(preference_query)
+    itinerary = await database_session.scalar(
+        select(Itinerary).where(
+            Itinerary.session_id == session_id,
+            Itinerary.status == "confirmed",
+        )
+    )
     if session is None or turn is None or preference is None:
         raise LookupError("Session context not found")
 
@@ -170,6 +190,7 @@ async def build_context_packet(
             session.context_version if context_version is None else context_version
         ),
         preference_version=preference.version,
+        itinerary_version=itinerary.version if itinerary is not None else 0,
         preference=preference.payload,
         recent_turns=[
             ContextTurn(
@@ -206,11 +227,48 @@ def decide(packet: ContextPacket) -> AgentDecision:
 
 
 def task_idempotency_key(
-    *, session_id: UUID, context_version: int, task_type: str, payload: dict
+    *,
+    session_id: UUID,
+    context_version: int,
+    target_itinerary_version: int,
+    task_type: str,
+    payload: dict,
 ) -> str:
     canonical_payload = json.dumps(payload, ensure_ascii=True, sort_keys=True)
-    source = f"{session_id}:{context_version}:{task_type}:{canonical_payload}"
+    source = (
+        f"{session_id}:{context_version}:{target_itinerary_version}:"
+        f"{task_type}:{canonical_payload}"
+    )
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def build_itinerary_content(
+    *,
+    destination: str,
+    context_version: int,
+    tool_calls,
+) -> dict[str, Any]:
+    items: list[dict[str, Any]] = []
+    for tool_call in tool_calls:
+        recommendations = (tool_call.output or {}).get("recommendations", [])
+        if not isinstance(recommendations, list):
+            continue
+        for recommendation in recommendations:
+            if not isinstance(recommendation, dict):
+                continue
+            items.append(
+                {
+                    "name": str(recommendation.get("name") or "未命名推荐"),
+                    "type": str(recommendation.get("category") or "activity"),
+                    "source_tool_call_ids": [str(tool_call.id)],
+                }
+            )
+    return {
+        "schema_version": 1,
+        "destination": destination,
+        "days": [{"day": 1, "items": items}],
+        "generated_from_context_version": context_version,
+    }
 
 
 async def create_tasks_for_decision(
@@ -233,11 +291,19 @@ async def create_tasks_for_decision(
                 Preference.status == "active",
             )
         )
+        itinerary = await database_session.scalar(
+            select(Itinerary).where(
+                Itinerary.session_id == packet.session_id,
+                Itinerary.status == "confirmed",
+            )
+        )
+        itinerary_version = itinerary.version if itinerary is not None else 0
         if (
             session is None
             or preference is None
             or session.context_version != packet.context_version
             or preference.version != packet.preference_version
+            or itinerary_version != packet.itinerary_version
             or decision.context_version != packet.context_version
             or decision.preference_version != packet.preference_version
         ):
@@ -247,6 +313,7 @@ async def create_tasks_for_decision(
             key = task_idempotency_key(
                 session_id=packet.session_id,
                 context_version=packet.context_version,
+                target_itinerary_version=packet.itinerary_version,
                 task_type=plan.task_type,
                 payload=plan.payload,
             )
@@ -265,6 +332,7 @@ async def create_tasks_for_decision(
                 turn_id=packet.turn_id,
                 context_version=packet.context_version,
                 target_preference_version=packet.preference_version,
+                target_itinerary_version=packet.itinerary_version,
                 task_type=plan.task_type,
                 idempotency_key=key,
                 deadline_at=datetime.now(timezone.utc) + timedelta(seconds=30),
@@ -283,6 +351,7 @@ async def create_tasks_for_decision(
                         "turn_id": str(packet.turn_id),
                         "context_version": packet.context_version,
                         "target_preference_version": packet.preference_version,
+                        "target_itinerary_version": packet.itinerary_version,
                         "task_type": task.task_type,
                     },
                     dedupe_key=f"task.queued:{task.id}",
@@ -298,7 +367,7 @@ async def compose_reply(
     session_id: UUID,
     turn_id: UUID,
     context_version: int,
-) -> ReplyContext | None:
+) -> ComposeResult:
     """Create one recoverable Agent reply from valid Mock task results."""
     async with database_session.begin():
         session = await database_session.scalar(
@@ -307,7 +376,7 @@ async def compose_reply(
             .with_for_update()
         )
         if session is None or session.context_version != context_version:
-            return None
+            return ComposeResult(reply=None)
         preference = await database_session.scalar(
             select(Preference).where(
                 Preference.session_id == session_id,
@@ -315,7 +384,7 @@ async def compose_reply(
             )
         )
         if preference is None:
-            return None
+            return ComposeResult(reply=None)
 
         existing = await database_session.scalar(
             select(EventOutbox).where(
@@ -323,7 +392,9 @@ async def compose_reply(
             )
         )
         if existing is not None:
-            return ReplyContext.model_validate(existing.payload["reply_context"])
+            return ComposeResult(
+                reply=ReplyContext.model_validate(existing.payload["reply_context"])
+            )
 
         tasks = list(
             (
@@ -339,23 +410,123 @@ async def compose_reply(
             ).all()
         )
         if not tasks:
-            return None
+            return ComposeResult(reply=None)
 
-        results = [task.result or {} for task in tasks]
+        target_itinerary_versions = {
+            task.target_itinerary_version for task in tasks
+        }
+        if None in target_itinerary_versions or len(target_itinerary_versions) != 1:
+            return ComposeResult(reply=None)
+
+        tool_calls = list(
+            (
+                await database_session.scalars(
+                    select(ToolCall)
+                    .where(
+                        ToolCall.task_id.in_([task.id for task in tasks]),
+                        ToolCall.session_id == session_id,
+                        ToolCall.context_version == context_version,
+                        ToolCall.target_preference_version == preference.version,
+                        ToolCall.status == "succeeded",
+                    )
+                    .order_by(ToolCall.created_at)
+                    .with_for_update()
+                )
+            ).all()
+        )
+        if len(tool_calls) != len(tasks):
+            return ComposeResult(reply=None)
+
+        expected_itinerary_version = target_itinerary_versions.pop()
+        confirmed_itinerary = await database_session.scalar(
+            select(Itinerary)
+            .where(
+                Itinerary.session_id == session_id,
+                Itinerary.status == "confirmed",
+            )
+            .with_for_update()
+        )
+        current_itinerary_version = (
+            confirmed_itinerary.version if confirmed_itinerary is not None else 0
+        )
+        if current_itinerary_version != expected_itinerary_version:
+            for task in tasks:
+                task.status = "discarded"
+                session.last_event_seq += 1
+                database_session.add(
+                    EventOutbox(
+                        session_id=session_id,
+                        event_seq=session.last_event_seq,
+                        event_type="task.result.discarded",
+                        payload={
+                            "task_id": str(task.id),
+                            "turn_id": str(task.turn_id) if task.turn_id else None,
+                            "context_version": task.context_version,
+                            "reason": "itinerary_version_conflict",
+                        },
+                        dedupe_key=f"task.discarded:{task.id}",
+                    )
+                )
+            return ComposeResult(reply=None, itinerary_conflict=True)
+
+        results = [tool_call.output or {} for tool_call in tool_calls]
         destination = str(preference.payload.get("destination") or "当前目的地")
+        now = datetime.now(timezone.utc)
+        if confirmed_itinerary is not None:
+            confirmed_itinerary.status = "superseded"
+
+        itinerary = Itinerary(
+            session_id=session_id,
+            version=expected_itinerary_version + 1,
+            context_version=context_version,
+            preference_version=preference.version,
+            status="confirmed",
+            content=build_itinerary_content(
+                destination=destination,
+                context_version=context_version,
+                tool_calls=tool_calls,
+            ),
+            budget_summary={
+                "currency": "N/A",
+                "estimated_total": 0,
+                "is_mock": True,
+            },
+            source_task_ids=[task.id for task in tasks],
+            confirmed_at=now,
+        )
+        database_session.add(itinerary)
+        await database_session.flush()
+        session.last_event_seq += 1
+        database_session.add(
+            EventOutbox(
+                session_id=session_id,
+                event_seq=session.last_event_seq,
+                event_type="itinerary.confirmed",
+                payload={
+                    "itinerary_id": str(itinerary.id),
+                    "version": itinerary.version,
+                    "context_version": context_version,
+                    "preference_version": preference.version,
+                    "source_task_ids": [str(task.id) for task in tasks],
+                    "source_tool_call_ids": [str(tool_call.id) for tool_call in tool_calls],
+                },
+                dedupe_key=f"itinerary.confirmed:{turn_id}:{context_version}",
+            )
+        )
         reply = ReplyContext(
-            message=f"已根据当前偏好整理 {destination} 的 Mock 旅行建议。",
+            message=f"已根据当前偏好整理 {destination} 的版本化旅行建议。",
             context_version=context_version,
             preference_version=preference.version,
             source_task_ids=[task.id for task in tasks],
             tool_results=results,
+            itinerary_version=itinerary.version,
+            source_tool_call_ids=[tool_call.id for tool_call in tool_calls],
         )
         next_sequence = await database_session.scalar(
             select(func.coalesce(func.max(Turn.sequence_no), 0) + 1).where(
                 Turn.session_id == session_id
             )
         )
-        now = datetime.now(timezone.utc)
         reply_turn = Turn(
             session_id=session_id,
             sequence_no=int(next_sequence),
@@ -384,7 +555,7 @@ async def compose_reply(
                 dedupe_key=f"agent.reply:{turn_id}:{context_version}",
             )
         )
-        return reply
+        return ComposeResult(reply=reply)
 
 
 def event_to_redis_fields(event: EventOutbox) -> dict[str, str]:
